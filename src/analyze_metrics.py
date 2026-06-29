@@ -334,7 +334,7 @@ def train_and_evaluate(absorb_live=False, tune=False):
     legit_cap = min(current_legit, 40000)
 
     cap_majority  = RandomUnderSampler(sampling_strategy={0: legit_cap}, random_state=42)
-    smote         = SMOTE(sampling_strategy=1.0, random_state=42, k_neighbors=5, n_jobs=-1)
+    smote         = SMOTE(sampling_strategy=1.0, random_state=42, k_neighbors=5)
     final_sync    = RandomOverSampler(sampling_strategy='auto', random_state=42)
 
     balance_pipeline = Pipeline(steps=[
