@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -552,46 +553,72 @@ _pipeline_procs: dict = {}
 _pipeline_procs_lock = threading.Lock()
 
 
-def _proc_alive(proc) -> bool:
-    return proc is not None and proc.poll() is None
+_PID_DIR = os.path.join(_PROJECT_ROOT, '.pids')
 
 
-def _script_running_on_os(script: str) -> bool:
-    """Check if a script is actually running as a OS process (Linux only)."""
-    if os.name == 'nt':
-        return False
+def _pid_file(name: str) -> str:
+    return os.path.join(_PID_DIR, f'{name}.pid')
+
+
+def _save_pid(name: str, pid: int):
+    os.makedirs(_PID_DIR, exist_ok=True)
+    with open(_pid_file(name), 'w') as f:
+        f.write(str(pid))
+
+
+def _read_pid(name: str):
     try:
-        result = subprocess.run(
-            ['pgrep', '-f', script],
-            capture_output=True, timeout=3,
-        )
-        return result.returncode == 0
+        with open(_pid_file(name)) as f:
+            return int(f.read().strip())
     except Exception:
-        return False
+        return None
 
 
-def _kill_script_on_os(script: str):
-    """Kill all OS processes matching a script path (Linux only)."""
-    if os.name == 'nt':
-        return
+def _clear_pid(name: str):
     try:
-        subprocess.run(['pkill', '-TERM', '-f', script], capture_output=True, timeout=3)
-        import time as _time
-        _time.sleep(1)
-        # Force-kill anything still alive
-        subprocess.run(['pkill', '-KILL', '-f', script], capture_output=True, timeout=3)
+        os.remove(_pid_file(name))
     except Exception:
         pass
+
+
+def _pid_alive(pid) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid):
+    if pid is None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(2)
+            if _pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _proc_alive(proc) -> bool:
+    return proc is not None and proc.poll() is None
 
 
 @app.get("/api/pipeline/status")
 def pipeline_status():
     result = {}
-    with _pipeline_procs_lock:
-        for name, script in _PIPELINE_SCRIPTS.items():
-            tracked_alive = _proc_alive(_pipeline_procs.get(name))
-            os_alive      = _script_running_on_os(script)
-            result[name]  = "running" if (tracked_alive or os_alive) else "stopped"
+    for name in _PIPELINE_SCRIPTS:
+        pid = _read_pid(name)
+        with _pipeline_procs_lock:
+            proc = _pipeline_procs.get(name)
+        alive = _pid_alive(pid) or _proc_alive(proc)
+        result[name] = "running" if alive else "stopped"
     return result
 
 
@@ -602,9 +629,8 @@ def pipeline_start():
     already = []
     with _pipeline_procs_lock:
         for name, script in _PIPELINE_SCRIPTS.items():
-            tracked_alive = _proc_alive(_pipeline_procs.get(name))
-            os_alive      = _script_running_on_os(script)
-            if tracked_alive or os_alive:
+            pid = _read_pid(name)
+            if _pid_alive(pid) or _proc_alive(_pipeline_procs.get(name)):
                 already.append(name)
                 continue
             proc = subprocess.Popen(
@@ -613,6 +639,7 @@ def pipeline_start():
                 env={**os.environ, "PYTHONPATH": os.path.join(_PROJECT_ROOT, "src")},
             )
             _pipeline_procs[name] = proc
+            _save_pid(name, proc.pid)
             started.append(name)
             logger.info("Pipeline: started %s (pid %d)", name, proc.pid)
     return {"status": "ok", "started": started, "already_running": already}
@@ -622,21 +649,22 @@ def pipeline_start():
 def pipeline_stop():
     stopped = []
     with _pipeline_procs_lock:
-        for name, script in _PIPELINE_SCRIPTS.items():
+        for name in list(_PIPELINE_SCRIPTS):
+            # Kill tracked in-memory process
             proc = _pipeline_procs.pop(name, None)
             if _proc_alive(proc):
-                proc.terminate()
                 try:
+                    proc.terminate()
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                stopped.append(name)
-                logger.info("Pipeline: stopped tracked %s", name)
-            # Also kill any orphaned OS-level processes (survives uvicorn reloads)
-            _kill_script_on_os(script)
-            if name not in stopped:
-                stopped.append(name)
-                logger.info("Pipeline: killed orphaned %s via pkill", name)
+            # Kill by saved PID (survives uvicorn reloads / redeploys)
+            pid = _read_pid(name)
+            if _pid_alive(pid):
+                _kill_pid(pid)
+            _clear_pid(name)
+            stopped.append(name)
+            logger.info("Pipeline: stopped %s (pid=%s)", name, pid)
     return {"status": "ok", "stopped": stopped}
 
 
