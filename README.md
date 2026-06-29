@@ -86,8 +86,8 @@ Both scripts:
 
 ## Dashboard Pages
 
-| URL | Description |
-| --- | --- |
+| URL                      | Description                     |
+| -------------------------| ------------------------------- |
 | `http://127.0.0.1:8000/` | Live transaction monitor (auto-refreshes every 1.5s) |
 | `http://127.0.0.1:8000/simulate` | Manually submit a transaction for prediction |
 | `http://127.0.0.1:8000/history` | Full SQLite transaction log |

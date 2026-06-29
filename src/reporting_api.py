@@ -418,6 +418,148 @@ def system_restart(request: Request):
         logger.error("system-restart failed: %s", e)
         return {"status": "error", "detail": str(e)}
 
+@app.post("/api/hard-restart")
+def hard_restart(request: Request):
+    """
+    Clean-slate restart: delete all .pkl model files and metrics.json, clear the
+    in-memory model cache, then retrain from scratch.  Track progress via
+    /api/training-progress.  Protected by the same API key and cooldown as
+    /api/system-restart.
+    """
+    global last_restart_time
+
+    if RESTART_API_KEY:
+        provided = request.headers.get("X-API-Key", "")
+        if provided != RESTART_API_KEY:
+            logger.warning("Unauthorized hard-restart attempt from %s",
+                           request.client.host if request.client else "unknown")
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error",
+                         "detail": "Unauthorized: invalid or missing X-API-Key header."}
+            )
+
+    with _training_lock:
+        if _training_state["running"]:
+            return {"status": "already_running",
+                    "detail": "Training is already in progress."}
+
+    current_time = time.time()
+    time_passed  = current_time - last_restart_time
+    if time_passed < RESTART_COOLDOWN:
+        remaining = int(RESTART_COOLDOWN - time_passed)
+        return {"status": "error",
+                "detail": f"Cooldown Active. Please wait {remaining} seconds before restarting again."}
+
+    last_restart_time = current_time
+
+    # Delete every trained model file and the metrics cache
+    _pkl_files = [
+        'Models/Random_Forest_model.pkl',
+        'Models/Extreme_Gradient_Boosting_model.pkl',
+        'Models/Light_Gradient_Boosting_Machine_model.pkl',
+        'Models/meta_learner.pkl',
+    ]
+    deleted = []
+    for path in _pkl_files:
+        if os.path.exists(path):
+            os.remove(path)
+            deleted.append(path)
+    if os.path.exists('metrics.json'):
+        os.remove('metrics.json')
+        deleted.append('metrics.json')
+
+    # Delete generated static chart images so stale charts don't linger
+    static_dir = 'static'
+    if os.path.isdir(static_dir):
+        for fname in os.listdir(static_dir):
+            if fname.endswith('.png'):
+                fpath = os.path.join(static_dir, fname)
+                os.remove(fpath)
+                deleted.append(fpath)
+
+    # Clear in-memory model cache so decision engine reloads after training
+    try:
+        try:
+            from decision_engine import _models, _model_mtimes
+        except ImportError:
+            from src.decision_engine import _models, _model_mtimes
+        _models.clear()
+        _model_mtimes.clear()
+    except Exception as e:
+        logger.warning("Could not clear model cache: %s", e)
+
+    logger.info("Hard restart: deleted %d file(s): %s", len(deleted), deleted)
+
+    t = threading.Thread(
+        target=_run_training_tracked, args=(["src/analyze_metrics.py", "--absorb-live"],), daemon=True
+    )
+    t.start()
+
+    return {"status": "started", "deleted": deleted}
+
+# ---------------------------------------------------------------------------
+# Pipeline process management (producer / preprocessing / decision_engine)
+# ---------------------------------------------------------------------------
+_PIPELINE_SCRIPTS = {
+    'producer':        'src/producer.py',
+    'preprocessing':   'src/preprocessing.py',
+    'decision_engine': 'src/decision_engine.py',
+}
+_pipeline_procs: dict = {}
+_pipeline_procs_lock = threading.Lock()
+
+
+def _proc_alive(proc) -> bool:
+    return proc is not None and proc.poll() is None
+
+
+@app.get("/api/pipeline/status")
+def pipeline_status():
+    with _pipeline_procs_lock:
+        return {
+            name: "running" if _proc_alive(_pipeline_procs.get(name)) else "stopped"
+            for name in _PIPELINE_SCRIPTS
+        }
+
+
+@app.post("/api/pipeline/start")
+def pipeline_start():
+    import sys
+    started = []
+    already = []
+    with _pipeline_procs_lock:
+        for name, script in _PIPELINE_SCRIPTS.items():
+            if _proc_alive(_pipeline_procs.get(name)):
+                already.append(name)
+                continue
+            proc = subprocess.Popen(
+                [sys.executable, script],
+                env={**os.environ, "PYTHONPATH": "src"},
+            )
+            _pipeline_procs[name] = proc
+            started.append(name)
+            logger.info("Pipeline: started %s (pid %d)", name, proc.pid)
+    return {"status": "ok", "started": started, "already_running": already}
+
+
+@app.post("/api/pipeline/stop")
+def pipeline_stop():
+    stopped = []
+    with _pipeline_procs_lock:
+        for name in list(_PIPELINE_SCRIPTS):
+            proc = _pipeline_procs.pop(name, None)
+            if _proc_alive(proc):
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                stopped.append(name)
+                logger.info("Pipeline: stopped %s", name)
+    return {"status": "ok", "stopped": stopped}
+
+
 try:
     from features import process_single_transaction
 except ImportError:
@@ -575,6 +717,26 @@ def get_saved_transactions(page: int = 1, limit: int = 50):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+@app.post("/api/clear-transactions")
+def clear_transactions():
+    """Delete all rows from live_transactions, reset in-memory store and counters."""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM live_transactions")
+            conn.commit()
+            conn.close()
+        transactions_store.clear()
+        with _stats_lock:
+            stats_store["total"]  = 0
+            stats_store["legit"]  = 0
+            stats_store["alerts"] = 0
+        logger.info("All live transaction data cleared.")
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error("clear-transactions failed: %s", e)
+        return {"status": "error", "detail": str(e)}
+
 @app.get("/metrics", response_class=HTMLResponse)
 def get_metrics_page():
     import time
@@ -681,6 +843,17 @@ def get_metrics_page():
             .metric-item p { font-size: 1.1em; margin-top: 10px; }
             .download-btn { display: inline-block; margin-top: 10px; padding: 6px 12px; font-size: 0.9em; background-color: #e8eaf6; color: #1a237e; text-decoration: none; border-radius: 4px; font-weight: bold; transition: 0.2s; }
             .download-btn:hover { background-color: #c5cae9; }
+            @media (max-width: 768px) {
+                .header { padding: 15px 10px; }
+                .header h1 { font-size: 1.3em; }
+                .header p { font-size: 0.85em; }
+                .header > div { display: flex !important; flex-wrap: wrap; justify-content: center; gap: 5px; }
+                .btn { padding: 6px 10px !important; font-size: 0.78em; margin: 2px !important; }
+                .container { padding: 0 12px; }
+                .metrics-grid { grid-template-columns: 1fr; }
+                .section { padding: 14px; }
+                #run-btn { width: 100%; box-sizing: border-box; }
+            }
         </style>
     </head>
     <body>
@@ -1470,6 +1643,18 @@ def get_dashboard():
             .badge-LEGIT { background-color: #c8e6c9; color: #2e7d32; }
             .badge-ALERT { background-color: #ffcdd2; color: #c62828; }
             .votes { font-family: monospace; }
+            @media (max-width: 768px) {
+                .header { padding: 15px 10px; }
+                .header h1 { font-size: 1.3em; }
+                .header p { font-size: 0.85em; }
+                .header > div { display: flex !important; flex-wrap: wrap; justify-content: center; gap: 5px; }
+                .btn { padding: 6px 10px !important; font-size: 0.78em; margin: 2px !important; }
+                .stats { flex-direction: column; }
+                .stat-card { margin: 5px 0 !important; min-width: unset !important; }
+                .stat-value { font-size: 1.6em; }
+                .container { padding: 0 12px; }
+                th, td { padding: 8px 10px; font-size: 0.85em; }
+            }
         </style>
     </head>
     <body>
@@ -1503,7 +1688,11 @@ def get_dashboard():
 
             </div>
             
-            <h3>Recent Transactions (Live Data)</h3>
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
+                <h3 style="margin:0;">Recent Transactions (Live Data)</h3>
+                <button id="clear-btn" onclick="clearTransactions()" style="background:#d32f2f;color:white;border:none;padding:8px 18px;border-radius:6px;font-weight:bold;font-size:0.85em;cursor:pointer;">Clear All Data</button>
+            </div>
+            <div style="overflow-x:auto;">
             <table id="tx-table">
                 <thead>
                     <tr>
@@ -1519,6 +1708,7 @@ def get_dashboard():
                     <!-- Populated by JS -->
                 </tbody>
             </table>
+            </div>
         </div>
 
         <script>
@@ -1564,6 +1754,30 @@ def get_dashboard():
             // Initial load
             updateStats();
             updateTable();
+
+            function clearTransactions() {
+                if (!confirm("Clear all live transaction data? This will delete every record from the database and reset all counters.")) return;
+                var btn = document.getElementById('clear-btn');
+                btn.disabled = true;
+                btn.textContent = 'Clearing...';
+                fetch('/api/clear-transactions', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    btn.disabled = false;
+                    btn.textContent = 'Clear All Data';
+                    if (data.status === 'ok') {
+                        updateStats();
+                        updateTable();
+                    } else {
+                        alert('Error: ' + (data.detail || 'Unknown error'));
+                    }
+                })
+                .catch(function(err) {
+                    btn.disabled = false;
+                    btn.textContent = 'Clear All Data';
+                    alert('Error: ' + err);
+                });
+            }
 
             function fullSystemRestart() {
                 if(!confirm("This will merge all live data into the master CSV, re-apply Hybrid Resampling (K-Means SMOTE-ENN), and completely re-train all models. Continue?")) return;
@@ -1621,6 +1835,17 @@ def get_simulate_page():
             table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 40px; }
             th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; font-size: 0.9em; }
             th { background-color: #e8eaf6; font-weight: bold; color: #1a237e; }
+            @media (max-width: 768px) {
+                .header { padding: 15px 10px; }
+                .header h1 { font-size: 1.3em; }
+                .header p { font-size: 0.85em; }
+                .header > div { display: flex !important; flex-wrap: wrap; justify-content: center; gap: 5px; }
+                .btn { padding: 6px 10px !important; font-size: 0.78em; margin: 2px !important; }
+                .container { padding: 0 12px; }
+                th, td { padding: 8px 8px; font-size: 0.82em; }
+                #simulate-form { flex-direction: column; }
+                #simulate-form > div { min-width: unset !important; }
+            }
         </style>
     </head>
     <body>
@@ -1674,6 +1899,7 @@ def get_simulate_page():
             </div>
             
             <h3 style="color: #1a237e;">Simulated API Traffic History (SQLite Db)</h3>
+            <div style="overflow-x:auto;">
             <table id="saved-tx-table">
                 <thead>
                     <tr>
@@ -1691,6 +1917,7 @@ def get_simulate_page():
                     <!-- Populated by JS -->
                 </tbody>
             </table>
+            </div>
         </div>
         
         <script>
@@ -1834,6 +2061,15 @@ def get_history_page():
             table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 40px; }
             th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
             th { background-color: #e8eaf6; font-weight: bold; color: #1a237e; }
+            @media (max-width: 768px) {
+                .header { padding: 15px 10px; }
+                .header h1 { font-size: 1.3em; }
+                .header p { font-size: 0.85em; }
+                .header > div { display: flex !important; flex-wrap: wrap; justify-content: center; gap: 5px; }
+                .btn { padding: 6px 10px !important; font-size: 0.78em; margin: 2px !important; }
+                .container { padding: 0 12px; }
+                th, td { padding: 8px 8px; font-size: 0.82em; }
+            }
         </style>
     </head>
     <body>
@@ -1853,6 +2089,7 @@ def get_history_page():
             <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px;">
                 <p>This page displays all transactions saved in the local <strong>transactions.db</strong>. These records are merged back into the model during the next Active Loop training run.</p>
             </div>
+            <div style="overflow-x:auto;">
             <table id="history-table">
                 <thead>
                     <tr>
@@ -1873,6 +2110,7 @@ def get_history_page():
                     <!-- Populated by JS -->
                 </tbody>
             </table>
+            </div>
         </div>
         <script>
             function loadHistory() {
@@ -1963,6 +2201,18 @@ def get_api_docs_page():
             .tab-btn.active { color: #1a237e; border-bottom: 2px solid #1a237e; }
             .tab-content { display: none; }
             .tab-content.active { display: block; }
+            @media (max-width: 768px) {
+                .header { padding: 15px 10px; }
+                .header h1 { font-size: 1.3em; }
+                .header p { font-size: 0.85em; }
+                .header > div { display: flex !important; flex-wrap: wrap; justify-content: center; gap: 5px; }
+                .btn { padding: 6px 10px !important; font-size: 0.78em; margin: 2px !important; }
+                .container { padding: 0 12px; }
+                .endpoint { padding: 15px; }
+                pre { font-size: 0.78em; }
+                .tabs { gap: 0; }
+                .tab-btn { padding: 8px 12px; font-size: 0.85em; }
+            }
         </style>
     </head>
     <body>
@@ -2182,6 +2432,18 @@ def get_master_page():
             .cooldown-text { margin-top: 15px; font-size: 0.9rem; font-weight: bold; opacity: 0; transition: opacity 0.3s; }
             .master-decoration { font-size: 3rem; margin-bottom: 20px; color: #ef4444; }
             .description { color: #666; margin-bottom: 40px; font-size: 1rem; line-height: 1.6; }
+            @media (max-width: 768px) {
+                .header { padding: 15px 10px; }
+                .header h1 { font-size: 1.3em; }
+                .header p { font-size: 0.85em; }
+                .header > div { display: flex !important; flex-wrap: wrap; justify-content: center; gap: 5px; }
+                .btn { padding: 6px 10px !important; font-size: 0.78em; margin: 2px !important; }
+                .container { padding: 25px 18px; margin: 30px auto; }
+            }
+            @media (max-width: 480px) {
+                .btn-master { width: 170px; height: 170px; font-size: 1rem; border-width: 6px; }
+                .master-decoration { font-size: 2rem; }
+            }
         </style>
     </head>
     <body>
@@ -2199,11 +2461,29 @@ def get_master_page():
         </div>
         
         <div style="max-width: 800px; margin: 60px auto; padding: 0 20px;">
+
+        <!-- ── Pipeline Control ── -->
+        <div style="background:white;padding:28px 35px;border-radius:14px;border:1px solid #e0e0e0;box-shadow:0 2px 10px rgba(0,0,0,0.08);margin-bottom:24px;text-align:center;">
+            <h3 style="margin:0 0 6px;color:#1a237e;font-size:0.85rem;letter-spacing:2px;text-transform:uppercase;font-weight:700;">Live Pipeline Control</h3>
+            <p style="margin:0 0 22px;color:#888;font-size:0.82rem;">Start or stop the streaming services independently of the model training cycle.</p>
+
+            <div style="display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-bottom:22px;">
+                <div id="badge-producer"        style="padding:8px 18px;border-radius:20px;font-size:0.82rem;font-weight:600;background:#f5f5f5;color:#888;border:1px solid #ddd;">● Producer</div>
+                <div id="badge-preprocessing"   style="padding:8px 18px;border-radius:20px;font-size:0.82rem;font-weight:600;background:#f5f5f5;color:#888;border:1px solid #ddd;">● Preprocessing</div>
+                <div id="badge-decision_engine" style="padding:8px 18px;border-radius:20px;font-size:0.82rem;font-weight:600;background:#f5f5f5;color:#888;border:1px solid #ddd;">● Decision Engine</div>
+            </div>
+
+            <div style="display:flex;gap:14px;justify-content:center;">
+                <button id="pipeline-start-btn" onclick="pipelineStart()" style="background:#1b5e20;color:white;border:none;padding:12px 32px;border-radius:8px;font-weight:700;font-size:0.95rem;cursor:pointer;letter-spacing:1px;">&#9654; START</button>
+                <button id="pipeline-stop-btn"  onclick="pipelineStop()"  style="background:#b71c1c;color:white;border:none;padding:12px 32px;border-radius:8px;font-weight:700;font-size:0.95rem;cursor:pointer;letter-spacing:1px;">&#9632; STOP</button>
+            </div>
+        </div>
+
         <div class="container">
             <div class="master-decoration">☢</div>
             <h2 style="margin-bottom: 10px; color: #333;">Full Pipeline Orchestration</h2>
             <p class="description">Consolidate live traffic data, re-apply Hybrid Balancing (K-Means SMOTE-ENN), and rebuild all predictive models. This action is restricted by a 5-minute cooldown.</p>
-            
+
             <button id="master-btn" class="btn-master" onclick="triggerMasterRestart()">
                 <span id="btn-label">INITIATE<br>RESTART</span>
             </button>
@@ -2216,57 +2496,148 @@ def get_master_page():
             var isRunning     = false;
             var progressTimer = null;
             var cooldownTimer = null;
-            var pctValue      = 0;
 
             function pctLabel(p, sub) {
                 return '<span style="font-size:2.4rem;font-weight:900;line-height:1;">' + p + '%</span>'
                      + '<span style="display:block;font-size:0.65rem;letter-spacing:3px;margin-top:6px;">' + (sub||'TRAINING') + '</span>';
             }
 
+            function _pollProgress() {
+                if (progressTimer) clearInterval(progressTimer);
+                progressTimer = setInterval(function () {
+                    fetch('/api/training-progress')
+                    .then(function(r) { return r.json(); })
+                    .then(function(state) {
+                        var btn    = document.getElementById('master-btn');
+                        var label  = document.getElementById('btn-label');
+                        var status = document.getElementById('status-display');
+
+                        var p = Math.min(state.percent || 0, 100);
+                        label.innerHTML = pctLabel(p);
+
+                        if (!state.running && p >= 100) {
+                            clearInterval(progressTimer);
+                            progressTimer = null;
+                            label.innerHTML    = pctLabel(100, 'COMPLETE');
+                            status.innerText   = 'ENGINE REBUILD COMPLETE';
+                            status.style.color = '#10b981';
+                            setTimeout(function () {
+                                alert('SUCCESS: All model files deleted and rebuilt from scratch.');
+                                location.reload();
+                            }, 900);
+                        } else if (!state.running && state.error) {
+                            clearInterval(progressTimer);
+                            progressTimer      = null;
+                            label.innerHTML    = 'INITIATE<br>RESTART';
+                            status.innerText   = 'TRAINING FAILED';
+                            status.style.color = '#f43f5e';
+                            alert('ERROR: ' + state.error);
+                            btn.disabled = false;
+                            isRunning    = false;
+                        }
+                    })
+                    .catch(function() {});
+                }, 1000);
+            }
+
+            // ── Pipeline Control ──────────────────────────────────────────
+            var _pipelineStatusInterval = null;
+
+            function _applyBadge(id, state) {
+                var el = document.getElementById(id);
+                if (!el) return;
+                var label = id.replace('badge-', '').replace('_', ' ');
+                label = label.charAt(0).toUpperCase() + label.slice(1);
+                if (state === 'running') {
+                    el.style.background = '#e8f5e9';
+                    el.style.color      = '#1b5e20';
+                    el.style.border     = '1px solid #a5d6a7';
+                    el.textContent      = '● ' + label;
+                } else {
+                    el.style.background = '#ffebee';
+                    el.style.color      = '#b71c1c';
+                    el.style.border     = '1px solid #ef9a9a';
+                    el.textContent      = '○ ' + label;
+                }
+            }
+
+            function refreshPipelineStatus() {
+                fetch('/api/pipeline/status')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    _applyBadge('badge-producer',        d.producer);
+                    _applyBadge('badge-preprocessing',   d.preprocessing);
+                    _applyBadge('badge-decision_engine', d.decision_engine);
+                })
+                .catch(function() {});
+            }
+
+            function pipelineStart() {
+                var btn = document.getElementById('pipeline-start-btn');
+                btn.disabled = true;
+                btn.textContent = 'Starting...';
+                fetch('/api/pipeline/start', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function() {
+                    btn.disabled = false;
+                    btn.innerHTML = '&#9654; START';
+                    refreshPipelineStatus();
+                })
+                .catch(function() {
+                    btn.disabled = false;
+                    btn.innerHTML = '&#9654; START';
+                });
+            }
+
+            function pipelineStop() {
+                var btn = document.getElementById('pipeline-stop-btn');
+                btn.disabled = true;
+                btn.textContent = 'Stopping...';
+                fetch('/api/pipeline/stop', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function() {
+                    btn.disabled = false;
+                    btn.innerHTML = '&#9632; STOP';
+                    refreshPipelineStatus();
+                })
+                .catch(function() {
+                    btn.disabled = false;
+                    btn.innerHTML = '&#9632; STOP';
+                });
+            }
+
+            // Initial status check + poll every 3 seconds
+            refreshPipelineStatus();
+            _pipelineStatusInterval = setInterval(refreshPipelineStatus, 3000);
+            // ─────────────────────────────────────────────────────────────
+
             function triggerMasterRestart() {
                 if (isRunning) return;
-                if (!confirm("COMMAND CONFIRMATION: Are you sure you want to trigger a full system re-training cycle? This will lock the engine for the duration of the build.")) return;
+                if (!confirm("COMMAND CONFIRMATION: This will DELETE all trained model files (.pkl) and metrics.json, then retrain all models from scratch. Continue?")) return;
 
                 var btn      = document.getElementById('master-btn');
                 var label    = document.getElementById('btn-label');
                 var status   = document.getElementById('status-display');
                 var cooldown = document.getElementById('cooldown-display');
 
-                // --- lock UI and start counter ---
                 isRunning    = true;
                 btn.disabled = true;
                 cooldown.style.opacity = '0';
                 if (cooldownTimer) { clearInterval(cooldownTimer); cooldownTimer = null; }
 
-                pctValue = 1;
-                label.innerHTML         = pctLabel(1);
-                status.innerText        = 'EXECUTING BALANCING & RE-TRAINING...';
-                status.style.color      = '#ef4444';
+                label.innerHTML    = pctLabel(0);
+                status.innerText   = 'DELETING MODELS & RETRAINING FROM SCRATCH...';
+                status.style.color = '#ef4444';
 
-                if (progressTimer) clearInterval(progressTimer);
-                progressTimer = setInterval(function () {
-                    pctValue = pctValue + (95 - pctValue) * 0.025;
-                    label.innerHTML = pctLabel(Math.round(pctValue));
-                }, 800);
-
-                fetch('/api/system-restart', { method: 'POST' })
-                    .then(function (r) { return r.json(); })
-                    .then(function (data) {
-                        // --- always stop the progress ticker first ---
-                        clearInterval(progressTimer);
-                        progressTimer = null;
-
-                        if (data.status === 'success') {
-                            label.innerHTML    = pctLabel(100, 'COMPLETE');
-                            status.innerText   = 'ENGINE REBUILD COMPLETE';
-                            status.style.color = '#10b981';
-                            setTimeout(function () {
-                                alert('SUCCESS: System re-validated and models redeployed.');
-                                location.reload();
-                            }, 900);
-
+                fetch('/api/hard-restart', { method: 'POST' })
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        if (data.status === 'started' || data.status === 'already_running') {
+                            if (data.status === 'already_running') {
+                                status.innerText = 'TRAINING ALREADY RUNNING — TRACKING PROGRESS...';
+                            }
+                            _pollProgress();
                         } else if (data.detail && data.detail.toLowerCase().includes('cooldown')) {
-                            // Restore button label immediately so it looks clickable again after timer
                             label.innerHTML    = 'INITIATE<br>RESTART';
                             status.innerText   = 'COMMAND REJECTED';
                             status.style.color = '#f43f5e';
@@ -2291,7 +2662,6 @@ def get_master_page():
                                     cooldown.innerText = 'COOLDOWN ACTIVE. PLEASE WAIT ' + remaining + ' SECONDS.';
                                 }
                             }, 1000);
-
                         } else {
                             label.innerHTML    = 'INITIATE<br>RESTART';
                             status.innerText   = 'COMMAND REJECTED';
@@ -2301,9 +2671,7 @@ def get_master_page():
                             isRunning    = false;
                         }
                     })
-                    .catch(function () {
-                        clearInterval(progressTimer);
-                        progressTimer      = null;
+                    .catch(function() {
                         label.innerHTML    = 'INITIATE<br>RESTART';
                         status.innerText   = 'INTERFACE ERROR';
                         status.style.color = '#f43f5e';
