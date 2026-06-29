@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill 185929 186162 187797)",
+      "Bash(awk '{print $1, $2, $11}')",
+      "Bash(kill 187732)",
+      "Bash(awk '{print $2, $10, $11}')",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('metrics.json'\\)\\); print\\('Best:', d['best_model']\\); print\\('P:', d['precision'], 'R:', d['recall'], 'F1:', d['f1_score'], 'AUC:', d['auc_roc']\\); print\\('Data:', d['full_data']\\); print\\('Dist after:', d['dist']['after']\\); [print\\(m['name'], '| P:', round\\(m['precision'],4\\), 'R:', round\\(m['recall'],4\\), 'F1:', round\\(m['f1_score'],4\\), 'AUC:', round\\(m['auc_roc'],4\\), 'T:', m['threshold'], 'CM:', m['cm']\\) for m in d['model_comparison']]\")",
+      "Bash(awk '{print \"PID:\"$2, \"CPU:\"$3, \"MEM:\"$4, \"TIME:\"$10}')",
+      "Bash(python3 -c ' *)",
+      "Bash(PYTHONPATH=src .venv-linux/bin/python3 src/analyze_metrics.py)",
+      "Bash(echo \"DONE $?\")",
+      "Bash(.venv-linux/bin/python3 -c ' *)",
+      "Bash(.venv-linux/bin/python3 /tmp/claude-1000/-media-anek-ANEK-DATA-My-Application-Details-UG-Application-Projects-new-project-pipline-fraud-detection/2a13beae-fddc-4958-8ac8-fb6cdbcad1d0/scratchpad/update_thesis.py)",
+      "Bash(.venv-linux/bin/python3 -m pytest tests/test_pipeline.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_pipeline.py -v)",
+      "Bash(python3 -W error -c \"import src.reporting_api\")",
+      "Bash(python3 -m pytest tests/test_pipeline.py -v --tb=short)",
+      "Bash(python3 -m pip show pytest)",
+      "Read(//home/anek/.local/bin/**)",
+      "Read(//home/anek/**)",
+      "Read(//opt/**)",
+      "Bash(pip3 show *)",
+      "Bash(/home/anek/anaconda3/bin/python -m pytest tests/test_pipeline.py -v --tb=short)",
+      "Bash(conda info *)",
+      "Bash(pip3.14 show *)",
+      "Bash(/home/anek/myenv/bin/python -m pip show fastapi kafka-python)",
+      "Bash(find /home/anek -name \"python*\" -path \"*/bin/*\" -type f 2>/dev/null | grep -v anaconda | grep -v myenv | head -10; ls /usr/local/bin/python* 2>/dev/null)",
+      "Read(//usr/local/bin/**)",
+      "Bash(/home/anek/.local/share/uv/python/cpython-3.14.0-linux-x86_64-gnu/bin/python3.14 -m pip show fastapi kafka-python)",
+      "Bash(xargs -I{} sh -c 'ls {} | grep -l fastapi 2>/dev/null && echo {}')",
+      "Bash(\"/media/anek/ANEK DATA/My Application Details/UG Application/Projects/new_project/pipline_fraud_detection/.venv-linux/bin/python\" -m pip show fastapi kafka-python scikit-learn)",
+      "Bash(.venv-linux/bin/python -m pytest tests/test_pipeline.py -v --tb=short)",
+      "Bash(.venv-linux/bin/python -m pytest tests/test_pipeline.py -q)",
+      "Bash(.venv-linux/bin/python -m pytest tests/test_pipeline.py -v --tb=short -x)",
+      "Bash(/home/anek/anaconda3/bin/pip show *)",
+      "Bash(.venv-linux/bin/python -c ' *)",
+      "Bash(.venv-linux/bin/python -)",
+      "Bash(.venv-linux/bin/python \"/tmp/claude-1000/-media-anek-ANEK-DATA-My-Application-Details-UG-Application-Projects-new-project-pipline-fraud-detection/037005a0-e157-42b1-835d-d46357530fa4/scratchpad/update_thesis.py\")"
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+.venv-linux/
+venv/
+env/
+ENV/
+
+# Model archive (can grow large; current Models/*.pkl stay in git for demo)
+Models/archive/
+
+# Static chart images — regenerated on every retrain
+static/*.png
+
+# SQLite live database — runtime data, not source
+Data/transactions.db
+
+# Environment variables
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Word doc backups and scratch
+*.docx
+"image use"/
+
+# OS
+.DS_Store
+Thumbs.db

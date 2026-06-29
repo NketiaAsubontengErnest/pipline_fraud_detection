@@ -1,25 +1,113 @@
 import json
 import asyncio
+import logging
+import os
 import subprocess
+import threading
+import time
 from collections import deque
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from kafka import KafkaConsumer
-from pydantic import BaseModel
+from kafka import KafkaConsumer, KafkaProducer
+from pydantic import BaseModel, field_validator
 
 import sqlite3
 
-KAFKA_BROKER = 'localhost:9092'
-SCORED_TOPIC = 'scored-transactions'
-MAX_HISTORY = 100
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger(__name__)
 
-import os
+KAFKA_BROKER     = os.getenv('KAFKA_BROKER', 'localhost:9092')
+DB_PATH          = os.getenv('DB_PATH', 'Data/transactions.db')
+RESTART_API_KEY  = os.getenv('RESTART_API_KEY', '')
+RESTART_COOLDOWN = int(os.getenv('RESTART_COOLDOWN', '300'))
+
+RAW_TOPIC    = 'raw-transactions'
+SCORED_TOPIC = 'scored-transactions'
+MAX_HISTORY  = 100
+
+last_restart_time = 0
+_db_lock          = threading.Lock()
+_stats_lock       = threading.Lock()
+_kafka_producer   = None
+
+# Training progress state
+_training_state = {"running": False, "percent": 0, "message": "Idle", "error": None}
+_training_lock  = threading.Lock()
+
+# Map log substrings → percentage milestones (in order)
+_PROGRESS_MILESTONES = [
+    ("Loading Data",                          5),
+    ("Extracting features",                  10),
+    ("Applying Hybrid Resampling",           20),
+    ("Training 3 models",                    28),
+    ("Training Random Forest",               35),
+    ("Training Extreme Gradient Boosting",   52),
+    ("Training Light Gradient Boosting",     68),
+    ("Training meta-learner",                80),
+    ("Best Individual Model",                87),
+    ("Archived",                             90),
+    ("Saved Models",                         93),
+    ("Saved static",                         96),
+    ("All metrics and charts generated",    100),
+]
+
+def _run_training_tracked(cmd_args):
+    """Run training subprocess, parse its log output to update _training_state."""
+    import sys
+    with _training_lock:
+        _training_state.update({"running": True, "percent": 0, "message": "Starting...", "error": None})
+    try:
+        proc = subprocess.Popen(
+            [sys.executable] + cmd_args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env={**os.environ, "PYTHONPATH": "src"},
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                logger.info("[training] %s", line)
+            for keyword, pct in _PROGRESS_MILESTONES:
+                if keyword.lower() in line.lower():
+                    with _training_lock:
+                        if pct > _training_state["percent"]:
+                            _training_state["percent"] = pct
+                            _training_state["message"] = line
+                    break
+        proc.wait()
+        with _training_lock:
+            if proc.returncode == 0:
+                _training_state.update({"running": False, "percent": 100, "message": "Training complete!"})
+            else:
+                _training_state.update({"running": False, "percent": 0, "message": "Training failed.", "error": "Non-zero exit code"})
+    except Exception as e:
+        with _training_lock:
+            _training_state.update({"running": False, "percent": 0, "message": "Error", "error": str(e)})
+
+def _get_producer():
+    """Lazy singleton Kafka producer for publishing live API transactions."""
+    global _kafka_producer
+    if _kafka_producer is None:
+        try:
+            _kafka_producer = KafkaProducer(
+                bootstrap_servers=[KAFKA_BROKER],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+        except Exception as e:
+            logger.warning("Could not connect Kafka producer: %s", e)
+    return _kafka_producer
+
 def init_db():
-    if not os.path.exists('Data'):
-        os.makedirs('Data')
-    conn = sqlite3.connect("Data/transactions.db")
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS live_transactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,7 +128,58 @@ def init_db():
 
 init_db()
 
-app = FastAPI(title="Fraud Detection Dashboard")
+def _run_training():
+    """Run analyze_metrics.py in a subprocess (non-blocking background thread)."""
+    import sys
+    logger.info("Auto-training triggered...")
+    result = subprocess.run(
+        [sys.executable, "src/analyze_metrics.py"],
+        capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": "src"},
+    )
+    if result.returncode == 0:
+        logger.info("Auto-training completed successfully.")
+    else:
+        logger.error("Auto-training failed:\n%s", result.stderr)
+
+def _watch_data_csv():
+    """Watch data.csv for changes and retrain automatically when it is modified."""
+    path = os.path.abspath("Data/data.csv")
+    last_mtime = os.path.getmtime(path) if os.path.exists(path) else None
+    logger.info("Watching %s for changes...", path)
+    while True:
+        time.sleep(30)
+        try:
+            mtime = os.path.getmtime(path)
+            if last_mtime is not None and mtime != last_mtime:
+                logger.info("data.csv changed — triggering auto-retrain...")
+                _run_training()
+            last_mtime = mtime
+        except FileNotFoundError:
+            pass
+
+def _daemon(target, *args):
+    """Start target as a daemon thread — killed automatically on process exit."""
+    t = threading.Thread(target=target, args=args, daemon=True)
+    t.start()
+    return t
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Auto-recreate metrics.json if it is missing or empty
+    if not os.path.exists("metrics.json") or os.path.getsize("metrics.json") == 0:
+        logger.info("metrics.json not found — running initial training...")
+        _daemon(_run_training_tracked, ["src/analyze_metrics.py"])
+
+    if not os.getenv('DISABLE_KAFKA_CONSUMER'):
+        _daemon(consume_scored_events)
+
+    if not os.getenv('DISABLE_DATA_WATCHER'):
+        _daemon(_watch_data_csv)
+
+    yield
+
+app = FastAPI(title="Fraud Detection Dashboard", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,49 +189,177 @@ app.add_middleware(
 )
 
 # Serve static files for our charts
+os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # In-memory store for the latest transactions
 transactions_store = deque(maxlen=MAX_HISTORY)
-stats_store = {
-    "total": 0,
-    "legit": 0,
-    "alerts": 0
-}
+
+def _load_stats_from_db():
+    """Seed in-memory counters from SQLite so stats survive server restarts."""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*), SUM(CASE WHEN status='ALERT' THEN 1 ELSE 0 END) FROM live_transactions")
+            row = c.fetchone()
+            conn.close()
+        total  = row[0] or 0
+        alerts = row[1] or 0
+        return {"total": total, "legit": total - alerts, "alerts": alerts}
+    except Exception:
+        return {"total": 0, "legit": 0, "alerts": 0}
+
+stats_store = _load_stats_from_db()
 
 def consume_scored_events():
-    """Background task to consume scored transactions from Kafka."""
-    try:
-        consumer = KafkaConsumer(
-            SCORED_TOPIC,
-            bootstrap_servers=[KAFKA_BROKER],
-            auto_offset_reset='latest',
-            enable_auto_commit=True,
-            value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-        )
-        print("API Consumer connected to Kafka!")
-        for message in consumer:
-            tx = message.value
-            transactions_store.appendleft(tx)
-            
-            stats_store["total"] += 1
-            if tx.get("status") == "ALERT":
-                stats_store["alerts"] += 1
-            else:
-                stats_store["legit"] += 1
-                
-    except Exception as e:
-        print(f"Error in background consumer: {e}")
+    """Consume scored transactions from Kafka, update dashboard, and persist to SQLite.
+    Reconnects automatically with exponential backoff on failure."""
+    consumer = None
+    retry_delay = 5
+    consecutive_failures = 0
+    while True:
+        try:
+            logger.info("Connecting Kafka consumer to '%s'...", SCORED_TOPIC)
+            consumer = KafkaConsumer(
+                SCORED_TOPIC,
+                bootstrap_servers=[KAFKA_BROKER],
+                auto_offset_reset='latest',
+                enable_auto_commit=True,
+                value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+            )
+            logger.info("Kafka consumer connected.")
+            retry_delay = 5
+            consecutive_failures = 0
+            for message in consumer:
+                tx = message.value
+                transactions_store.appendleft(tx)
 
-@app.on_event("startup")
-async def startup_event():
-    # Run the Kafka consumer in a background thread
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, consume_scored_events)
+                with _stats_lock:
+                    stats_store["total"] += 1
+                    if tx.get("status") == "ALERT":
+                        stats_store["alerts"] += 1
+                    else:
+                        stats_store["legit"] += 1
+
+                raw = tx.get('raw', {})
+                try:
+                    with _db_lock:
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        c.execute(
+                            '''INSERT INTO live_transactions
+                               (tx_id, tx_date, amount, merchant_id, tx_type, location,
+                                rf_vote, xgb_vote, lgb_vote, status)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (
+                                tx.get('tx_id', ''),
+                                raw.get('TransactionDate', ''),
+                                raw.get('Amount', 0),
+                                raw.get('MerchantID', 0),
+                                raw.get('TransactionType', ''),
+                                raw.get('Location', ''),
+                                tx.get('rf_pred', 0),
+                                tx.get('xgb_pred', 0),
+                                tx.get('lgb_pred', 0),
+                                tx.get('status', 'LEGIT'),
+                            )
+                        )
+                        conn.commit()
+                        conn.close()
+                except Exception as db_err:
+                    logger.error("Error saving Kafka tx to SQLite: %s", db_err)
+
+        except Exception as e:
+            consecutive_failures += 1
+            log_fn = logger.error if consecutive_failures == 1 else logger.warning
+            log_fn("Kafka unavailable (%s). Retrying in %ds...", e, retry_delay)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+        finally:
+            if consumer is not None:
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+                consumer = None
 
 @app.get("/api/stats")
 def get_stats():
     return stats_store
+
+@app.get("/health")
+def health_check():
+    """Returns ok/degraded status for models, database, and Kafka producer."""
+    health: dict = {"status": "ok", "models": "unknown", "database": "unknown", "kafka": "unknown"}
+    try:
+        try:
+            from decision_engine import _models, _load_models
+        except ImportError:
+            from src.decision_engine import _models, _load_models
+        _load_models()
+        health["models"] = "ok" if len(_models) == 3 else "degraded"
+    except Exception as e:
+        health["models"] = f"error: {e}"
+        health["status"] = "degraded"
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("SELECT 1")
+            conn.close()
+        health["database"] = "ok"
+    except Exception as e:
+        health["database"] = f"error: {e}"
+        health["status"] = "degraded"
+    producer = _get_producer()
+    health["kafka"] = "ok" if producer is not None else "unavailable"
+    return health
+
+@app.get("/api/training-progress")
+def get_training_progress():
+    """Return current training progress state."""
+    with _training_lock:
+        return dict(_training_state)
+
+@app.get("/api/dataset-stats")
+def get_dataset_stats():
+    """Read Data/data.csv directly and return live row counts."""
+    try:
+        import csv
+        total = legit = fraud = 0
+        with open("Data/data.csv", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                total += 1
+                if row.get("IsFraud", "0").strip() == "1":
+                    fraud += 1
+                else:
+                    legit += 1
+        return {
+            "total": total,
+            "legit": legit,
+            "fraud": fraud,
+            "legit_pct": round(legit / total * 100, 2) if total else 0,
+            "fraud_pct": round(fraud / total * 100, 2) if total else 0,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/api/dist-stats")
+def get_dist_stats():
+    """Return before/after class distribution counts from the latest metrics.json."""
+    try:
+        with open("metrics.json", "r") as f:
+            data = json.load(f)
+        dist = data.get("dist", {})
+        after = dist.get("after", [0, 0])
+        return {
+            "after_legit": after[0],
+            "after_fraud": after[1],
+            "after_total": after[0] + after[1],
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/api/transactions")
 def get_recent_transactions():
@@ -100,29 +367,61 @@ def get_recent_transactions():
 
 @app.post("/api/run-analysis")
 def run_analysis():
-    """Endpoint triggered by UI to run analyze_metrics.py"""
+    """Retrain models on current data.csv — runs in background, track via /api/training-progress."""
+    with _training_lock:
+        if _training_state["running"]:
+            return {"status": "already_running", "detail": "Training is already in progress."}
+    t = threading.Thread(target=_run_training_tracked, args=(["src/analyze_metrics.py"],), daemon=True)
+    t.start()
+    return {"status": "started"}
+
+@app.post("/api/system-restart")
+def system_restart(request: Request):
+    """
+    Full pipeline restart with a configurable cooldown:
+    1. Merges live SQLite traffic into data.csv (active learning).
+    2. Re-applies K-Means SMOTE-ENN balancing.
+    3. Re-trains all 3 models.
+    Protected by an optional API key (set RESTART_API_KEY env var to enable).
+    """
+    global last_restart_time
+
+    if RESTART_API_KEY:
+        provided = request.headers.get("X-API-Key", "")
+        if provided != RESTART_API_KEY:
+            logger.warning("Unauthorized restart attempt from %s", request.client.host if request.client else "unknown")
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error", "detail": "Unauthorized: invalid or missing X-API-Key header."}
+            )
+
+    current_time = time.time()
+    time_passed  = current_time - last_restart_time
+
+    if time_passed < RESTART_COOLDOWN:
+        remaining = int(RESTART_COOLDOWN - time_passed)
+        return {"status": "error", "detail": f"Cooldown Active. Please wait {remaining} seconds before restarting again."}
+
     try:
-        # Run the script and capture the output
+        import sys
+        last_restart_time = current_time
+        logger.info("Starting full pipeline restart (absorb-live + retrain)...")
         result = subprocess.run(
-            ["venv\\Scripts\\python.exe", "src\\analyze_metrics.py"], 
-            capture_output=True, 
-            text=True
+            [sys.executable, "src/analyze_metrics.py", "--absorb-live"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
         )
-        
-        # After creating images natively, move them to static directory via PS copy to handle windows paths
-        subprocess.run(
-            ["powershell.exe", "-Command", "Move-Item -Path '*.png' -Destination 'static\\' -Force"]
-        )
-        
+        logger.info("Full restart completed.")
         return {"status": "success", "output": result.stdout}
     except Exception as e:
+        logger.error("system-restart failed: %s", e)
         return {"status": "error", "detail": str(e)}
 
-import os
-import joblib
-from typing import Dict, Any
-
-from features import process_single_transaction
+try:
+    from features import process_single_transaction
+except ImportError:
+    from src.features import process_single_transaction
 
 class TransactionPayload(BaseModel):
     TransactionID: str
@@ -131,98 +430,147 @@ class TransactionPayload(BaseModel):
     MerchantID: int
     TransactionType: str
     Location: str
-    
+
+    @field_validator('Amount')
+    @classmethod
+    def amount_must_be_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError('Amount must be greater than 0')
+        return v
+
+    @field_validator('TransactionType')
+    @classmethod
+    def transaction_type_must_be_valid(cls, v: str) -> str:
+        if v not in ('purchase', 'refund'):
+            raise ValueError("TransactionType must be 'purchase' or 'refund'")
+        return v
+
+
 @app.post("/api/predict")
 def predict_transaction(payload: TransactionPayload):
     """
-    Accepts a single transaction JSON.
-    Loads precisely cached AI Models on demand & performs live scoring.
+    Smartphone / Live API path (matches architecture diagram).
+    1. Scores the transaction directly for an immediate HTTP response.
+    2. Publishes to Kafka raw-transactions so it flows through the full
+       pipeline (Preprocessing -> Decision Engine -> Vault/SQLite -> Active Learning).
+    If Kafka is unavailable, falls back to a direct SQLite write so no data is lost.
     """
     try:
-        data_dict = payload.dict()
-        
-        # 1. Map raw json into correct numerical feature vector map
+        import time as _time
+        data_dict = payload.model_dump()
+
+        # 1. Extract feature vector
         feature_vector = process_single_transaction(data_dict)
-        
-        # Structure as 2D array expected by scikit
         arr = [feature_vector]
-        
-        # 2. Lazy load the highly-optimized cached trained models from Models directory
-        models = {}
-        for algo in ["Random_Forest", "Extreme_Gradient_Boosting", "Light_Gradient_Boosting_Machine"]:
-            path = f"Models/{algo}_model.pkl"
-            if os.path.exists(path):
-                models[algo] = joblib.load(path)
-        
-        if not models:
-            return {"status": "error", "detail": "No machine learning models have been trained and cached. Please visit /metrics to evaluate Offline processing."}
-            
-        # 3. Predict dynamically against the parsed features!
-        predictions = {}
-        status = "LEGIT"
-        
-        for name, model in models.items():
-            pred = int(model.predict(arr)[0])
-            predictions[name] = pred
-            # Simple ensemble check logic: if ANY model thinks it is fraud, raise an ALERT!
-            if pred == 1:
-                status = "ALERT"
-                
-        # 4. Formulate cleanly formatted analytical response output!
+
+        # 2. Score via the shared decision engine (uses per-model optimal thresholds from metrics.json)
+        try:
+            from decision_engine import decide
+        except ImportError:
+            from src.decision_engine import decide
+
+        result = decide(feature_vector)
+
+        predictions = {
+            "Random_Forest":                  result['rf'],
+            "Extreme_Gradient_Boosting":      result['xgb'],
+            "Light_Gradient_Boosting_Machine":result['lgb'],
+        }
+        status = result['status']
+
         resp = {
             "status": status,
             "predictions_breakdown": predictions,
-            "feature_vector_used": feature_vector
+            "probabilities": {
+                "Random_Forest":                   round(result['rf_prob'],  4),
+                "Extreme_Gradient_Boosting":       round(result['xgb_prob'], 4),
+                "Light_Gradient_Boosting_Machine": round(result['lgb_prob'], 4),
+            },
+            "feature_vector_used": feature_vector,
         }
-        
-        # Save to SQLite table for live tracking
-        try:
-            conn = sqlite3.connect("Data/transactions.db")
-            c = conn.cursor()
-            c.execute('''INSERT INTO live_transactions 
-                         (tx_id, tx_date, amount, merchant_id, tx_type, location, rf_vote, xgb_vote, lgb_vote, status)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (data_dict['TransactionID'], data_dict['TransactionDate'], data_dict['Amount'],
-                       data_dict['MerchantID'], data_dict['TransactionType'], data_dict['Location'],
-                       predictions.get("Random_Forest", 0), predictions.get("Extreme_Gradient_Boosting", 0),
-                       predictions.get("Light_Gradient_Boosting_Machine", 0), status))
-            conn.commit()
-            conn.close()
-        except Exception as db_err:
-            print(f"Error saving live to DB: {db_err}")
-            
-        import time
-        tx_doc = {
-            "timestamp": int(time.time()),
-            "tx_id": data_dict['TransactionID'],
-            "rf_pred": predictions.get("Random_Forest", 0),
-            "xgb_pred": predictions.get("Extreme_Gradient_Boosting", 0),
-            "lgb_pred": predictions.get("Light_Gradient_Boosting_Machine", 0),
-            "status": status
+
+        # 4. Publish to Kafka raw-transactions so the transaction travels the full
+        #    pipeline and is persisted to SQLite by consume_scored_events()
+        kafka_tx = {
+            'tx_id':           data_dict['TransactionID'],
+            'timestamp':       _time.time(),
+            'TransactionDate': data_dict['TransactionDate'],
+            'Amount':          data_dict['Amount'],
+            'MerchantID':      data_dict['MerchantID'],
+            'TransactionType': data_dict['TransactionType'],
+            'Location':        data_dict['Location'],
         }
-        transactions_store.appendleft(tx_doc)
-        
-        stats_store["total"] += 1
-        if status == "ALERT":
-            stats_store["alerts"] += 1
-        else:
-            stats_store["legit"] += 1
-            
+        producer = _get_producer()
+        kafka_ok = False
+        if producer:
+            try:
+                producer.send(RAW_TOPIC, kafka_tx)
+                producer.flush()
+                kafka_ok = True
+            except Exception as ke:
+                logger.warning("Kafka publish failed: %s", ke)
+
+        if not kafka_ok:
+            # Fallback: Kafka unavailable — write directly so no data is lost
+            try:
+                with _db_lock:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute(
+                        '''INSERT INTO live_transactions
+                           (tx_id, tx_date, amount, merchant_id, tx_type, location,
+                            rf_vote, xgb_vote, lgb_vote, status)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (
+                            data_dict['TransactionID'], data_dict['TransactionDate'],
+                            data_dict['Amount'], data_dict['MerchantID'],
+                            data_dict['TransactionType'], data_dict['Location'],
+                            predictions.get("Random_Forest", 0),
+                            predictions.get("Extreme_Gradient_Boosting", 0),
+                            predictions.get("Light_Gradient_Boosting_Machine", 0),
+                            status,
+                        )
+                    )
+                    conn.commit()
+                    conn.close()
+                tx_doc = {
+                    "timestamp": int(_time.time()),
+                    "tx_id": data_dict['TransactionID'],
+                    "rf_pred": predictions.get("Random_Forest", 0),
+                    "xgb_pred": predictions.get("Extreme_Gradient_Boosting", 0),
+                    "lgb_pred": predictions.get("Light_Gradient_Boosting_Machine", 0),
+                    "status": status,
+                }
+                transactions_store.appendleft(tx_doc)
+                with _stats_lock:
+                    stats_store["total"] += 1
+                    if status == "ALERT":
+                        stats_store["alerts"] += 1
+                    else:
+                        stats_store["legit"] += 1
+            except Exception as db_err:
+                logger.error("Fallback SQLite write failed: %s", db_err)
+
         return resp
-        
+
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
 @app.get("/api/saved-transactions")
-def get_saved_transactions():
-    """Retrieve the recent transactions recorded successfully in the local SQLite db array."""
+def get_saved_transactions(page: int = 1, limit: int = 50):
+    """Retrieve paginated transactions from SQLite. Use ?page=N&limit=M."""
     try:
-        conn = sqlite3.connect("Data/transactions.db")
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM live_transactions ORDER BY id DESC LIMIT 50")
-        rows = c.fetchall()
-        conn.close()
+        offset = (max(page, 1) - 1) * limit
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute(
+                "SELECT * FROM live_transactions ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            )
+            rows = c.fetchall()
+            conn.close()
         return [dict(ix) for ix in rows]
     except Exception as e:
         return {"status": "error", "detail": str(e)}
@@ -231,7 +579,71 @@ def get_saved_transactions():
 def get_metrics_page():
     import time
     v = int(time.time())
-    
+
+    if not os.path.exists("metrics.json") or os.path.getsize("metrics.json") == 0:
+        return HTMLResponse(content="""
+        <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+        <title>Training in Progress</title>
+        <style>
+        *{box-sizing:border-box;}
+        body{font-family:'Segoe UI',sans-serif;background:#f4f6f9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+        .box{background:white;padding:48px 64px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.12);text-align:center;width:520px;max-width:95vw;}
+        h2{color:#1a237e;margin:16px 0 6px;font-size:1.5em;}
+        .subtitle{color:#666;margin:0 0 28px;font-size:0.95em;}
+        .spin-wrap{font-size:2.4em;animation:spin 1.5s linear infinite;display:inline-block;margin-bottom:4px;}
+        @keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+        .pct-label{font-size:2.8em;font-weight:bold;color:#1a237e;margin:10px 0 8px;letter-spacing:1px;}
+        .bar-track{background:#e0e0e0;border-radius:8px;height:20px;overflow:hidden;margin:0 0 14px;}
+        .bar-fill{height:100%;width:0%;background:linear-gradient(90deg,#1a237e,#39aa73);border-radius:8px;transition:width 0.6s ease;}
+        .step-msg{color:#555;font-size:0.88em;min-height:20px;margin-bottom:20px;word-break:break-word;}
+        .hint{color:#bbb;font-size:0.78em;margin-top:16px;}
+        </style>
+        </head>
+        <body>
+        <div class="box" id="box">
+            <div class="spin-wrap" id="spin-icon">&#9696;</div>
+            <h2 id="title">Training in Progress</h2>
+            <p class="subtitle" id="sub">Models are being trained automatically. Please wait.</p>
+            <div class="pct-label" id="pct-label">0%</div>
+            <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
+            <div class="step-msg" id="step-msg">Starting...</div>
+            <p class="hint">Updates every second &mdash; page reloads automatically when done.</p>
+        </div>
+        <script>
+        function poll(){
+            fetch('/api/training-progress')
+            .then(r=>r.json())
+            .then(s=>{
+                const p=Math.min(s.percent||0,100);
+                document.getElementById('bar').style.width=p+'%';
+                document.getElementById('pct-label').textContent=p+'%';
+                document.getElementById('step-msg').textContent=s.message||'';
+                if(!s.running && p>=100){
+                    document.getElementById('bar').style.background='linear-gradient(90deg,#2e7d32,#39aa73)';
+                    document.getElementById('pct-label').style.color='#2e7d32';
+                    document.getElementById('spin-icon').textContent='✓';
+                    document.getElementById('spin-icon').style.cssText='font-size:2.4em;color:#39aa73;';
+                    document.getElementById('title').textContent='Training Complete!';
+                    document.getElementById('title').style.color='#2e7d32';
+                    document.getElementById('sub').textContent='Reloading metrics page…';
+                    document.getElementById('step-msg').textContent='All models trained successfully.';
+                    setTimeout(()=>window.location.reload(true),1500);
+                } else if(!s.running && s.error){
+                    document.getElementById('bar').style.background='#d32f2f';
+                    document.getElementById('title').textContent='Training Failed';
+                    document.getElementById('title').style.color='#c62828';
+                    document.getElementById('step-msg').textContent='Error: '+(s.error||'Unknown error');
+                } else {
+                    setTimeout(poll,1000);
+                }
+            })
+            .catch(()=>setTimeout(poll,2000));
+        }
+        poll();
+        </script>
+        </body></html>
+        """, status_code=202)
+
     precision, recall, f1, auc = "0.000", "0.000", "0.000", "0.000"
     data_str = "{}"
     try:
@@ -239,9 +651,9 @@ def get_metrics_page():
             data = json.load(f)
             data_str = json.dumps(data)
             precision = data.get("precision", "0.000")
-            recall = data.get("recall", "0.000")
-            f1 = data.get("f1_score", "0.000")
-            auc = data.get("auc_roc", "0.000")
+            recall    = data.get("recall",    "0.000")
+            f1        = data.get("f1_score",  "0.000")
+            auc       = data.get("auc_roc",   "0.000")
     except Exception:
         pass
         
@@ -281,14 +693,23 @@ def get_metrics_page():
                 <a href="/history" class="btn" style="margin: 0 5px;">Transaction History</a>
                 <a href="/metrics" class="btn" style="margin: 0 5px; background: transparent; color: white; border-color: white;">Offline Training Metrics</a>
                 <a href="/api-docs" class="btn" style="margin: 0 5px;">API Reference</a>
+                <a href="/master" class="btn" style="margin: 0 5px; background: #333; color: white; border: none;">Control Center</a>
             </div>
         </div>
         <div class="container">
-            <div style="display: flex; justify-content: flex-end; align-items: center; margin-bottom: 20px;">
-                <button id="run-btn" onclick="runAnalysis()" style="background: #e8eaf6; padding: 10px 15px; border-radius: 4px; color: #1a237e; text-decoration: none; font-weight: bold; border: none; cursor: pointer; display: flex; align-items: center;">
-                    <span id="run-text">&#9654; Run Active Loop & Train Model</span>
-                    <span id="run-spinner" style="display: none; margin-left: 10px;">...</span>
+            <div style="display: flex; flex-direction: column; align-items: flex-end; margin-bottom: 20px; gap: 10px;">
+                <button id="run-btn" onclick="runAnalysis()" style="background: #e8eaf6; padding: 10px 15px; border-radius: 4px; color: #1a237e; font-weight: bold; border: none; cursor: pointer;">
+                    &#9654; Run Active Loop &amp; Train Model
                 </button>
+                <div id="progress-wrap" style="display:none; width: 100%; max-width: 500px;">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                        <span id="progress-msg" style="font-size:0.85em; color:#555;">Starting...</span>
+                        <span id="progress-pct" style="font-size:0.85em; font-weight:bold; color:#1a237e;">0%</span>
+                    </div>
+                    <div style="background:#e0e0e0; border-radius:6px; height:14px; overflow:hidden;">
+                        <div id="progress-bar" style="height:100%; width:0%; background:linear-gradient(90deg,#1a237e,#39aa73); border-radius:6px; transition:width 0.5s ease;"></div>
+                    </div>
+                </div>
             </div>
 
             <div class="section" id="overview-section" style="display: none;">
@@ -296,15 +717,15 @@ def get_metrics_page():
                 <div style="display: flex; justify-content: space-around; flex-wrap: wrap; text-align: center; gap: 20px;">
                     <div style="background: #e8eaf6; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px; border: 1px solid #c5cae9;">
                         <h3 style="margin: 0; color: #1a237e;">Total Transactions</h3>
-                        <p id="overview-total" style="font-size: 2em; font-weight: bold; margin: 10px 0 0; color: #333;"></p>
+                        <p id="overview-total" style="font-size: 2em; font-weight: bold; margin: 10px 0 0; color: #333;">Loading...</p>
                     </div>
                     <div style="background: #e8f5e9; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px; border: 1px solid #c8e6c9;">
                         <h3 style="margin: 0; color: #2e7d32;">Total Legitimate</h3>
-                        <p id="overview-legit" style="font-size: 2em; font-weight: bold; margin: 10px 0 0; color: #333;"></p>
+                        <p id="overview-legit" style="font-size: 2em; font-weight: bold; margin: 10px 0 0; color: #333;">Loading...</p>
                     </div>
                     <div style="background: #ffebee; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px; border: 1px solid #ffcdd2;">
                         <h3 style="margin: 0; color: #c62828;">Total Fraud</h3>
-                        <p id="overview-fraud" style="font-size: 2em; font-weight: bold; margin: 10px 0 0; color: #333;"></p>
+                        <p id="overview-fraud" style="font-size: 2em; font-weight: bold; margin: 10px 0 0; color: #333;">Loading...</p>
                     </div>
                 </div>
             </div>
@@ -380,30 +801,32 @@ def get_metrics_page():
             </div>
 
             <div class="section">
+                <h2 style="text-align:center; margin-bottom: 20px;">Model Performance Curves</h2>
                 <div style="display: flex; flex-wrap: wrap; gap: 20px; justify-content: center;">
-                    <div style="flex: 1; min-width: 300px; max-width: 550px; position: relative; height: 350px;">
+                    <div style="flex: 1; min-width: 280px; max-width: 380px; position: relative; height: 320px;">
+                        <canvas id="recallChart"></canvas>
+                        <div style="text-align: center; margin-top: 15px;">
+                            <a href="#" onclick="downloadCanvas('recallChart', 'recall_curve.png'); return false;" class="download-btn">&darr; Download Recall Curve</a>
+                        </div>
+                    </div>
+                    <div style="flex: 1; min-width: 280px; max-width: 380px; position: relative; height: 320px;">
                         <canvas id="f1Chart"></canvas>
                         <div style="text-align: center; margin-top: 15px;">
                             <a href="#" onclick="downloadCanvas('f1Chart', 'f1_score.png'); return false;" class="download-btn">&darr; Download F1-score Curve</a>
                         </div>
                     </div>
-                    <div style="flex: 1; min-width: 300px; max-width: 550px; position: relative; height: 350px;">
+                    <div style="flex: 1; min-width: 280px; max-width: 380px; position: relative; height: 320px;">
                         <canvas id="rocChart"></canvas>
                         <div style="text-align: center; margin-top: 15px;">
-                            <a href="#" onclick="downloadCanvas('rocChart', 'roc_curve.png'); return false;" class="download-btn">&darr; Download ROC Curve</a>
+                            <a href="#" onclick="downloadCanvas('rocChart', 'roc_curve.png'); return false;" class="download-btn">&darr; Download AUC-ROC Curve</a>
                         </div>
                     </div>
                 </div>
             </div>
 
-            <div class="section">
-                <h2 style="text-align:center;">Confusion Matrix (Random Forest)</h2>
-                <div class="img-container" style="max-width: 500px; margin: auto;">
-                    <img src="/static/confusion_matrix.png?v={V}" alt="Confusion Matrix" style="width: 100%; border-radius: 6px;">
-                </div>
-                <div style="text-align: center; margin-top: 15px;">
-                    <a href="/static/confusion_matrix.png" download="confusion_matrix.png" class="download-btn">&darr; Download Confusion Matrix</a>
-                </div>
+            <div class="section" id="cm-section" style="display:none;">
+                <h2 style="text-align:center;">Confusion Matrices</h2>
+                <div id="cm-container" style="display:flex; flex-wrap:wrap; gap:30px; justify-content:center; margin-top:20px;"></div>
             </div>
             
             <div style="text-align: center; color: #666; margin-top: 40px; margin-bottom: 20px; font-size: 0.9em; padding-top: 15px; border-top: 1px solid #ccc;">
@@ -412,43 +835,93 @@ def get_metrics_page():
         </div>
         
         <script>
-        function runAnalysis() {
-            const btn = document.getElementById('run-btn');
-            const text = document.getElementById('run-text');
-            const spinner = document.getElementById('run-spinner');
-            
-            // UI Loading state
-            btn.disabled = true;
-            btn.style.opacity = '0.7';
-            text.innerText = "Training Model... (Please wait a few seconds)";
-            spinner.style.display = "inline-block";
+        let _pollTimer = null;
 
-            // Trigger the internal training script
+        function runAnalysis() {
+            const btn  = document.getElementById('run-btn');
+            const wrap = document.getElementById('progress-wrap');
+            const bar  = document.getElementById('progress-bar');
+            const msg  = document.getElementById('progress-msg');
+            const pct  = document.getElementById('progress-pct');
+
+            btn.disabled = true;
+            btn.style.opacity = '0.6';
+            btn.textContent = 'Training...';
+            wrap.style.display = 'block';
+            bar.style.width = '0%';
+            msg.textContent = 'Starting...';
+            pct.textContent = '0%';
+
             fetch('/api/run-analysis', { method: 'POST' })
-            .then(response => response.json())
+            .then(r => r.json())
             .then(data => {
-                btn.disabled = false;
-                btn.style.opacity = '1';
-                text.innerHTML = "&#10004; Training Complete!";
-                spinner.style.display = "none";
-                
-                if (data.status === 'success') {
-                    // Log the python console output inside the browser!
-                    console.log(data.output);
-                    // Refresh the page immediately to load the brand new updated graph PNGs
-                    setTimeout(() => window.location.reload(true), 1000);
-                } else {
-                    alert("Error running analysis: " + data.detail);
+                if (data.status === 'already_running') {
+                    msg.textContent = 'Already running — tracking existing progress...';
+                } else if (data.status !== 'started') {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    btn.innerHTML = '&#9654; Run Active Loop &amp; Train Model';
+                    wrap.style.display = 'none';
+                    alert('Failed to start training: ' + (data.detail || JSON.stringify(data)));
+                    return;
                 }
+                _pollProgress();
             })
             .catch(err => {
-                alert("Request failed: " + err);
                 btn.disabled = false;
                 btn.style.opacity = '1';
-                text.innerHTML = "&#9654; Run 70/15/15 Split & Train Model";
-                spinner.style.display = "none";
+                btn.innerHTML = '&#9654; Run Active Loop &amp; Train Model';
+                wrap.style.display = 'none';
+                alert('Request failed: ' + err);
             });
         }
+
+        function _pollProgress() {
+            if (_pollTimer) clearInterval(_pollTimer);
+            _pollTimer = setInterval(() => {
+                fetch('/api/training-progress')
+                .then(r => r.json())
+                .then(state => {
+                    const btn  = document.getElementById('run-btn');
+                    const wrap = document.getElementById('progress-wrap');
+                    const bar  = document.getElementById('progress-bar');
+                    const msg  = document.getElementById('progress-msg');
+                    const pct  = document.getElementById('progress-pct');
+
+                    const p = Math.min(state.percent || 0, 100);
+                    bar.style.width = p + '%';
+                    pct.textContent = p + '%';
+                    msg.textContent = state.message || '';
+
+                    if (!state.running && p >= 100) {
+                        clearInterval(_pollTimer);
+                        bar.style.background = 'linear-gradient(90deg,#2e7d32,#39aa73)';
+                        msg.textContent = 'Training complete! Reloading...';
+                        btn.innerHTML = '&#10004; Done';
+                        setTimeout(() => window.location.reload(true), 1200);
+                    } else if (!state.running && state.error) {
+                        clearInterval(_pollTimer);
+                        bar.style.background = '#d32f2f';
+                        msg.textContent = 'Error: ' + state.error;
+                        btn.disabled = false;
+                        btn.style.opacity = '1';
+                        btn.innerHTML = '&#9654; Run Active Loop &amp; Train Model';
+                    }
+                })
+                .catch(() => {});
+            }, 1000);
+        }
+
+        // Resume polling if training was already running when page loaded
+        fetch('/api/training-progress').then(r => r.json()).then(state => {
+            if (state.running) {
+                document.getElementById('progress-wrap').style.display = 'block';
+                document.getElementById('run-btn').disabled = true;
+                document.getElementById('run-btn').style.opacity = '0.6';
+                document.getElementById('run-btn').textContent = 'Training...';
+                _pollProgress();
+            }
+        }).catch(() => {});
 
         const pluginBg = {
             id: 'customCanvasBackgroundColor',
@@ -515,16 +988,8 @@ def get_metrics_page():
 
         if(metricsData.curves && metricsData.dist) {
             
-            // Render Stats Overview Block
-            const legitCt = metricsData.dist.before[0];
-            const fraudCt = metricsData.dist.before[1];
-            const totalCt = legitCt + fraudCt;
-            const legitPct = ((legitCt / totalCt) * 100).toFixed(2);
-            const fraudPct = ((fraudCt / totalCt) * 100).toFixed(2);
-            
-            document.getElementById('overview-total').innerText = totalCt.toLocaleString();
-            document.getElementById('overview-legit').innerText = `${legitCt.toLocaleString()} (${legitPct}%)`;
-            document.getElementById('overview-fraud').innerText = `${fraudCt.toLocaleString()} (${fraudPct}%)`;
+            // Dataset Overview cards + Before Balance chart are both populated
+            // from /api/dataset-stats which reads data.csv live (see chart section below)
             document.getElementById('overview-section').style.display = 'block';
 
             if(metricsData.df) {
@@ -546,7 +1011,7 @@ def get_metrics_page():
                     tr.style.backgroundColor = (i % 2 === 0) ? '#f9f9f9' : '#fff';
                     metricsData.df.columns.forEach(col => {
                         const td = document.createElement('td');
-                        td.innerText = (typeof row[col] === 'number') ? row[col].toFixed(4).replace(/\.?0+$/, '') : row[col];
+                        td.innerText = (typeof row[col] === 'number') ? row[col].toFixed(4).replace(/\\.?0+$/, '') : row[col];
                         td.style.padding = '8px 10px';
                         td.style.border = '1px solid #ddd';
                         tr.appendChild(td);
@@ -578,7 +1043,7 @@ def get_metrics_page():
                                 td.style.fontWeight = 'bold';
                                 td.style.backgroundColor = '#e8f5e9'; // Accent context
                             } else {
-                                td.innerText = (typeof row[col] === 'number') ? row[col].toFixed(4).replace(/\.?0+$/, '') : row[col];
+                                td.innerText = (typeof row[col] === 'number') ? row[col].toFixed(4).replace(/\\.?0+$/, '') : row[col];
                             }
                             td.style.padding = '8px 10px';
                             td.style.border = '1px solid #ddd';
@@ -604,7 +1069,7 @@ def get_metrics_page():
 
                     // Alg name
                     const tdName = document.createElement('td');
-                    tdName.innerText = item.name + (isBest ? ' (Winner) ' + String.fromCodePoint(0x1F451) : '');
+                    tdName.innerText = item.name + (isBest ? ' (Winner)' : '');
                     tdName.style.padding = '10px';
                     tdName.style.border = '1px solid #ddd';
                     tr.appendChild(tdName);
@@ -623,40 +1088,253 @@ def get_metrics_page():
                     tbody.appendChild(tr);
                 });
                 document.getElementById('comparison-section').style.display = 'block';
+
+                // Render confusion matrices — academic Canvas style (Blues colormap, row-normalised)
+                const cmContainer = document.getElementById('cm-container');
+                if (cmContainer) {
+                    // Blues colormap: #f7fbff (0) → #08306b (1)
+                    function blueCss(t) {
+                        const r = Math.round(247 + (8   - 247) * t);
+                        const g = Math.round(251 + (48  - 251) * t);
+                        const b = Math.round(255 + (107 - 255) * t);
+                        return [r, g, b];
+                    }
+                    function blueFill(ctx, t) {
+                        const [r,g,b] = blueCss(t);
+                        ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+                    }
+                    function cellTextColor(t) { return t > 0.45 ? 'white' : '#111'; }
+
+                    function drawCM(canvas, item) {
+                        const [[TN, FP], [FN, TP]] = item.cm;
+                        const isBest     = item.name === metricsData.best_model;
+                        const W = canvas.width, H = canvas.height;
+                        const ctx = canvas.getContext('2d');
+
+                        // White background
+                        ctx.clearRect(0, 0, W, H);
+                        ctx.fillStyle = '#ffffff';
+                        ctx.fillRect(0, 0, W, H);
+
+                        // Layout margins
+                        const mTop = 72, mLeft = 92, mRight = 68, mBottom = 72;
+                        const gW = W - mLeft - mRight;
+                        const gH = H - mTop - mBottom;
+                        const cW = gW / 2, cH = gH / 2;
+
+                        const legitTotal = TN + FP, fraudTotal = FN + TP;
+                        const total      = TN + FP + FN + TP;
+                        const cells      = [[TN, FP], [FN, TP]];
+                        const rowTotals  = [legitTotal, fraudTotal];
+                        const classLabels = ['Legit (0)', 'Fraud (1)'];
+
+                        // ── Title ──────────────────────────────────────────
+                        ctx.textAlign = 'center';
+                        ctx.font = 'bold 15px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = '#111';
+                        ctx.fillText('Confusion Matrix', W / 2, 20);
+
+                        ctx.font = '12px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = isBest ? '#1b5e20' : '#444';
+                        ctx.fillText(item.name + (isBest ? '  ★ Best Model' : ''), W / 2, 38);
+
+                        ctx.font = '10.5px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = '#888';
+                        const aucTxt = 'AUC-ROC: ' + parseFloat(item.auc_roc || 0).toFixed(4)
+                                     + '   Threshold: ' + (item.threshold !== undefined ? item.threshold.toFixed(2) : 'N/A')
+                                     + '   Accuracy: ' + (total > 0 ? ((TN+TP)/total*100).toFixed(2) : '—') + '%';
+                        ctx.fillText(aucTxt, W / 2, 56);
+
+                        // ── Cells ──────────────────────────────────────────
+                        for (let row = 0; row < 2; row++) {
+                            for (let col = 0; col < 2; col++) {
+                                const val  = cells[row][col];
+                                const rTot = rowTotals[row];
+                                const t    = rTot > 0 ? val / rTot : 0;
+                                const x    = mLeft + col * cW;
+                                const y    = mTop  + row * cH;
+
+                                // Cell fill
+                                blueFill(ctx, t);
+                                ctx.fillRect(x, y, cW, cH);
+
+                                // White grid lines
+                                ctx.strokeStyle = '#ffffff';
+                                ctx.lineWidth = 2;
+                                ctx.strokeRect(x, y, cW, cH);
+
+                                const tc = cellTextColor(t);
+                                ctx.textAlign = 'center';
+
+                                // Raw count (large)
+                                ctx.font = 'bold 20px "Helvetica Neue", Arial, sans-serif';
+                                ctx.fillStyle = tc;
+                                ctx.fillText(val.toLocaleString(), x + cW / 2, y + cH / 2 - 4);
+
+                                // Row-normalised %
+                                ctx.font = '12px "Helvetica Neue", Arial, sans-serif';
+                                ctx.fillStyle = tc;
+                                ctx.globalAlpha = 0.85;
+                                ctx.fillText(rTot > 0 ? (t * 100).toFixed(1) + '%' : '—',
+                                             x + cW / 2, y + cH / 2 + 18);
+                                ctx.globalAlpha = 1.0;
+                            }
+                        }
+
+                        // Outer border
+                        ctx.strokeStyle = '#aaa';
+                        ctx.lineWidth = 1;
+                        ctx.strokeRect(mLeft, mTop, gW, gH);
+
+                        // ── X-axis (Predicted Label) ────────────────────────
+                        ctx.font = '12px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = '#333';
+                        ctx.textAlign = 'center';
+                        classLabels.forEach((lbl, i) => {
+                            ctx.fillText(lbl, mLeft + i * cW + cW / 2, mTop + gH + 18);
+                        });
+                        ctx.font = 'bold 13px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = '#111';
+                        ctx.fillText('Predicted Label', mLeft + gW / 2, mTop + gH + 42);
+
+                        // ── Y-axis (Actual Label) ───────────────────────────
+                        ctx.font = '12px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = '#333';
+                        classLabels.forEach((lbl, i) => {
+                            ctx.save();
+                            ctx.translate(mLeft - 36, mTop + i * cH + cH / 2);
+                            ctx.rotate(-Math.PI / 2);
+                            ctx.textAlign = 'center';
+                            ctx.fillText(lbl, 0, 0);
+                            ctx.restore();
+                        });
+                        ctx.save();
+                        ctx.translate(16, mTop + gH / 2);
+                        ctx.rotate(-Math.PI / 2);
+                        ctx.textAlign = 'center';
+                        ctx.font = 'bold 13px "Helvetica Neue", Arial, sans-serif';
+                        ctx.fillStyle = '#111';
+                        ctx.fillText('Actual Label', 0, 0);
+                        ctx.restore();
+
+                        // ── Colorbar ────────────────────────────────────────
+                        const cbX = W - mRight + 14, cbY = mTop, cbW = 12, cbH = gH;
+                        const grad = ctx.createLinearGradient(0, cbY + cbH, 0, cbY);
+                        [0, 0.25, 0.5, 0.75, 1].forEach(s => {
+                            const [r,g,b] = blueCss(s);
+                            grad.addColorStop(s, 'rgb(' + r + ',' + g + ',' + b + ')');
+                        });
+                        ctx.fillStyle = grad;
+                        ctx.fillRect(cbX, cbY, cbW, cbH);
+                        ctx.strokeStyle = '#bbb';
+                        ctx.lineWidth = 0.5;
+                        ctx.strokeRect(cbX, cbY, cbW, cbH);
+
+                        ctx.font = '9.5px Arial';
+                        ctx.fillStyle = '#555';
+                        ctx.textAlign = 'left';
+                        ctx.fillText('100%', cbX + cbW + 3, cbY + 9);
+                        ctx.fillText('75%',  cbX + cbW + 3, cbY + cbH * 0.25 + 4);
+                        ctx.fillText('50%',  cbX + cbW + 3, cbY + cbH * 0.5  + 4);
+                        ctx.fillText('25%',  cbX + cbW + 3, cbY + cbH * 0.75 + 4);
+                        ctx.fillText('0%',   cbX + cbW + 3, cbY + cbH);
+
+                        // Colorbar label
+                        ctx.save();
+                        ctx.translate(W - 8, cbY + cbH / 2);
+                        ctx.rotate(Math.PI / 2);
+                        ctx.textAlign = 'center';
+                        ctx.font = '9px Arial';
+                        ctx.fillStyle = '#777';
+                        ctx.fillText('Row-normalised', 0, 0);
+                        ctx.restore();
+                    }
+
+                    metricsData.model_comparison.forEach(item => {
+                        if (!item.cm) return;
+
+                        const wrap = document.createElement('div');
+                        wrap.style.cssText = 'display:flex; flex-direction:column; align-items:center; gap:10px;';
+
+                        const canvas = document.createElement('canvas');
+                        canvas.width  = 440;
+                        canvas.height = 390;
+                        canvas.style.cssText = 'border:1px solid #ddd; border-radius:4px; background:white; max-width:100%;';
+                        wrap.appendChild(canvas);
+
+                        // Download button
+                        const dlBtn = document.createElement('button');
+                        dlBtn.innerHTML = '&#8595; Download PNG';
+                        dlBtn.style.cssText = 'padding:7px 20px; background:#0B1B3D; color:white; border:none; border-radius:5px; cursor:pointer; font-size:0.84em; font-family:inherit; letter-spacing:0.3px;';
+                        dlBtn.onmouseover = () => { dlBtn.style.background = '#1a3a6b'; };
+                        dlBtn.onmouseout  = () => { dlBtn.style.background = '#0B1B3D'; };
+                        dlBtn.onclick = () => {
+                            const a = document.createElement('a');
+                            a.download = 'confusion_matrix_' + item.name.replace(/\\s+/g, '_') + '.png';
+                            a.href = canvas.toDataURL('image/png', 1.0);
+                            a.click();
+                        };
+                        wrap.appendChild(dlBtn);
+
+                        cmContainer.appendChild(wrap);
+                        drawCM(canvas, item);
+                    });
+                    document.getElementById('cm-section').style.display = 'block';
+                }
             }
 
             Chart.defaults.plugins.customCanvasBackgroundColor = { color: 'white' };
             const footerOpt = { text: "Generated by Real-Time Fraud Detection System" };
 
-            // Distribution Graphic Before
-            new Chart(document.getElementById('distBeforeChart'), {
-                type: 'bar',
-                data: {
-                    labels: ['0', '1'],
-                    datasets: [{ label: 'Count', data: metricsData.dist.before, backgroundColor: ['#0B1B3D', '#FF8C00'], barPercentage: 0.6 }]
-                },
-                options: { 
-                    layout: { padding: { top: 45, bottom: 25 } },
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { title: {display: true, text: 'Class Distribution Before Balance', font: {size: 15}}, legend: {display:false}, customFooter: footerOpt },
-                    scales: { y: { suggestedMax: Math.max(...metricsData.dist.before) * 1.20, title: {display: true, text:'Count'} }, x: { title: {display: true, text:'IsFraud'} } }
-                }
-            });
+            // Distribution Graphic Before — data read live from data.csv via API
+            fetch('/api/dataset-stats')
+                .then(r => r.json())
+                .then(ds => {
+                    if (ds.error) return;
 
-            // Distribution Graphic After
-            new Chart(document.getElementById('distAfterChart'), {
-                type: 'bar',
-                data: {
-                    labels: ['0', '1'],
-                    datasets: [{ label: 'Count', data: metricsData.dist.after, backgroundColor: ['#0B1B3D', '#FF8C00'], barPercentage: 0.6 }]
-                },
-                options: { 
-                    layout: { padding: { top: 45, bottom: 25 } },
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { title: {display: true, text: 'Class Distribution After Balance (Under & Over)', font: {size: 15}}, legend: {display:false}, customFooter: footerOpt },
-                    scales: { y: { suggestedMax: Math.max(...metricsData.dist.after) * 1.20, title: {display: true, text:'Count'} }, x: { title: {display: true, text:'IsFraud'} } }
-                }
-            });
+                    // Update Dataset Overview cards
+                    document.getElementById('overview-total').innerText = ds.total.toLocaleString();
+                    document.getElementById('overview-legit').innerText = ds.legit.toLocaleString() + ' (' + ds.legit_pct + '%)';
+                    document.getElementById('overview-fraud').innerText = ds.fraud.toLocaleString() + ' (' + ds.fraud_pct + '%)';
+
+                    const beforeData = [ds.legit, ds.fraud];
+                    new Chart(document.getElementById('distBeforeChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: ['0', '1'],
+                            datasets: [{ label: 'Count', data: beforeData, backgroundColor: ['#0B1B3D', '#FF8C00'], barPercentage: 0.6 }]
+                        },
+                        options: {
+                            layout: { padding: { top: 45, bottom: 25 } },
+                            responsive: true, maintainAspectRatio: false,
+                            plugins: { title: {display: true, text: 'Class Distribution Before Balance', font: {size: 15}}, legend: {display:false}, customFooter: footerOpt },
+                            scales: { y: { suggestedMax: Math.max(...beforeData) * 1.20, title: {display: true, text:'Count'} }, x: { title: {display: true, text:'IsFraud'} } }
+                        }
+                    });
+                })
+                .catch(() => {});
+
+            // Distribution Graphic After — fetched live from metrics.json via API
+            fetch('/api/dist-stats')
+                .then(r => r.json())
+                .then(ds => {
+                    if (ds.error) return;
+                    const afterData = [ds.after_legit, ds.after_fraud];
+                    new Chart(document.getElementById('distAfterChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: ['0', '1'],
+                            datasets: [{ label: 'Count', data: afterData, backgroundColor: ['#0B1B3D', '#FF8C00'], barPercentage: 0.6 }]
+                        },
+                        options: {
+                            layout: { padding: { top: 45, bottom: 25 } },
+                            responsive: true, maintainAspectRatio: false,
+                            plugins: { title: {display: true, text: 'Class Distribution After Balance (Under & Over)', font: {size: 15}}, legend: {display:false}, customFooter: footerOpt },
+                            scales: { y: { suggestedMax: Math.max(...afterData) * 1.20, title: {display: true, text:'Count'} }, x: { title: {display: true, text:'IsFraud'} } }
+                        }
+                    });
+                })
+                .catch(() => {});
 
             // Model Evaluation Metrics
             new Chart(document.getElementById('metricsChart'), {
@@ -678,35 +1356,76 @@ def get_metrics_page():
                 }
             });
 
-            // F1 Curve
-            new Chart(document.getElementById('f1Chart'), {
+            // Recall Curve — linear x-axis so points are at their true threshold positions
+            new Chart(document.getElementById('recallChart'), {
                 type: 'line',
-                data: { labels: metricsData.curves.thresholds.map(t => t.toFixed(2)), datasets: [{ label: 'F1-score', data: metricsData.curves.f1_scores, borderColor: '#ff7f0e', fill: false, tension: 0.1, borderWidth: 2 }] },
-                options: { 
+                data: {
+                    datasets: [{
+                        label: 'Recall',
+                        data: metricsData.curves.thresholds.map((t, i) => ({x: t, y: metricsData.curves.recalls[i]})),
+                        borderColor: '#d62728', fill: false, tension: 0, borderWidth: 2, pointRadius: 0, hitRadius: 10,
+                    }]
+                },
+                options: {
                     layout: { padding: { top: 10, bottom: 25 } },
-                    responsive: true, maintainAspectRatio: false, elements: { point: { radius: 0, hitRadius: 10 } }, 
-                    plugins: { title: {display: true, text: 'F1-score Curve', font: {size: 16}}, legend: {display:false}, customFooter: footerOpt },
-                    scales: { y: { min: 0, max: 1.05, title: {display: true, text:'F1-score'} }, x: { title: { display: true, text: 'Decision Threshold' } } } 
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { title: {display: true, text: 'Recall Curve', font: {size: 15}}, legend: {display:false}, customFooter: footerOpt },
+                    scales: {
+                        x: { type: 'linear', min: 0, max: 1, title: { display: true, text: 'Decision Threshold' } },
+                        y: { min: 0, max: 1.05, title: { display: true, text: 'Recall' } }
+                    }
                 }
             });
 
-            // Large ROC Curve
-            new Chart(document.getElementById('rocChart'), {
+            // F1-score Curve — linear x-axis so points are at their true threshold positions
+            new Chart(document.getElementById('f1Chart'), {
                 type: 'line',
-                data: { 
-                    labels: metricsData.curves.fpr.map(f => f.toFixed(2)), 
-                    datasets: [
-                        { label: 'AUC = ' + metricsData.auc_roc, data: metricsData.curves.tpr, borderColor: '#1f77b4', fill: false, tension: 0.1, borderWidth: 2 }, 
-                        { label: 'Random Guess', data: metricsData.curves.fpr, borderColor: 'navy', borderDash:[5,5], fill: false, borderWidth: 2 }
-                    ] 
+                data: {
+                    datasets: [{
+                        label: 'F1-score',
+                        data: metricsData.curves.thresholds.map((t, i) => ({x: t, y: metricsData.curves.f1_scores[i]})),
+                        borderColor: '#ff7f0e', fill: false, tension: 0, borderWidth: 2, pointRadius: 0, hitRadius: 10,
+                    }]
                 },
-                options: { 
+                options: {
                     layout: { padding: { top: 10, bottom: 25 } },
-                    responsive: true, maintainAspectRatio: false, elements: { point: { radius: 0, hitRadius: 10 } }, 
-                    plugins: { title: {display: true, text: 'AUC-ROC Curve', font: {size: 16}}, legend: {position: 'bottom'}, customFooter: footerOpt },
-                    scales: { y: { min: 0, title: {display: true, text:'True Positive Rate'} }, x: { title: { display: true, text: 'False Positive Rate' } } } 
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { title: {display: true, text: 'F1-score Curve', font: {size: 15}}, legend: {display:false}, customFooter: footerOpt },
+                    scales: {
+                        x: { type: 'linear', min: 0, max: 1, title: { display: true, text: 'Decision Threshold' } },
+                        y: { min: 0, max: 1.05, title: { display: true, text: 'F1-score' } }
+                    }
                 }
             });
+
+            // AUC-ROC Curve — linear x-axis so FPR is at its true numeric position
+            new Chart(document.getElementById('rocChart'), {
+                type: 'line',
+                data: {
+                    datasets: [
+                        {
+                            label: 'AUC = ' + metricsData.auc_roc,
+                            data: metricsData.curves.fpr.map((f, i) => ({x: f, y: metricsData.curves.tpr[i]})),
+                            borderColor: '#1f77b4', fill: false, tension: 0, borderWidth: 2, pointRadius: 0, hitRadius: 10,
+                        },
+                        {
+                            label: 'Random Guess',
+                            data: [{x: 0, y: 0}, {x: 1, y: 1}],
+                            borderColor: 'navy', borderDash: [5, 5], fill: false, tension: 0, borderWidth: 2, pointRadius: 0,
+                        }
+                    ]
+                },
+                options: {
+                    layout: { padding: { top: 10, bottom: 25 } },
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { title: {display: true, text: 'AUC-ROC Curve', font: {size: 15}}, legend: {position: 'bottom'}, customFooter: footerOpt },
+                    scales: {
+                        x: { type: 'linear', min: 0, max: 1, title: { display: true, text: 'False Positive Rate' } },
+                        y: { min: 0, max: 1.05, title: { display: true, text: 'True Positive Rate' } }
+                    }
+                }
+            });
+
         }
         </script>
     </body>
@@ -763,6 +1482,7 @@ def get_dashboard():
                 <a href="/history" class="btn" style="margin: 0 5px;">Transaction History</a>
                 <a href="/metrics" class="btn" style="margin: 0 5px;">Offline Training Metrics</a>
                 <a href="/api-docs" class="btn" style="margin: 0 5px;">API Reference</a>
+                <a href="/master" class="btn" style="margin: 0 5px; background: #333; color: white; border: none;">Control Center</a>
             </div>
         </div>
         <div class="container">
@@ -779,6 +1499,8 @@ def get_dashboard():
                     <div>Fraud Alerts</div>
                     <div class="stat-value val-alert" id="stat-alerts">0</div>
                 </div>
+            </div>
+
             </div>
             
             <h3>Recent Transactions (Live Data)</h3>
@@ -842,6 +1564,36 @@ def get_dashboard():
             // Initial load
             updateStats();
             updateTable();
+
+            function fullSystemRestart() {
+                if(!confirm("This will merge all live data into the master CSV, re-apply Hybrid Resampling (K-Means SMOTE-ENN), and completely re-train all models. Continue?")) return;
+                
+                const btn = document.querySelector('button[onclick="fullSystemRestart()"]');
+                const originalText = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = "Processing Full Restart...";
+                btn.style.opacity = '0.7';
+
+                fetch('/api/system-restart', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if(data.status === 'success') {
+                        alert("System Re-trained Successfully! Models are now updated.");
+                        window.location.reload();
+                    } else {
+                        alert("Restart Failed: " + data.detail);
+                        btn.disabled = false;
+                        btn.innerHTML = originalText;
+                        btn.style.opacity = '1';
+                    }
+                })
+                .catch(err => {
+                    alert("Error: " + err);
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                    btn.style.opacity = '1';
+                });
+            }
         </script>
     </body>
     </html>
@@ -881,6 +1633,7 @@ def get_simulate_page():
                 <a href="/history" class="btn" style="margin: 0 5px;">Transaction History</a>
                 <a href="/metrics" class="btn" style="margin: 0 5px;">Offline Training Metrics</a>
                 <a href="/api-docs" class="btn" style="margin: 0 5px;">API Reference</a>
+                <a href="/master" class="btn" style="margin: 0 5px; background: #333; color: white; border: none;">Control Center</a>
             </div>
         </div>
         <div class="container">
@@ -1024,6 +1777,36 @@ def get_simulate_page():
             
             // Invoke table load securely on cold boots
             updateSavedTable();
+
+            function fullSystemRestart() {
+                if(!confirm("This will merge all live data into the master CSV, re-apply Hybrid Resampling (K-Means SMOTE-ENN), and completely re-train all models. Continue?")) return;
+                
+                const btn = document.querySelector('button[onclick="fullSystemRestart()"]');
+                const originalText = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = "Processing Full Restart...";
+                btn.style.opacity = '0.7';
+
+                fetch('/api/system-restart', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if(data.status === 'success') {
+                        alert("System Re-trained Successfully! Models are now updated.");
+                        window.location.reload();
+                    } else {
+                        alert("Restart Failed: " + data.detail);
+                        btn.disabled = false;
+                        btn.innerHTML = originalText;
+                        btn.style.opacity = '1';
+                    }
+                })
+                .catch(err => {
+                    alert("Error: " + err);
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                    btn.style.opacity = '1';
+                });
+            }
         </script>
     </body>
     </html>
@@ -1063,6 +1846,7 @@ def get_history_page():
                 <a href="/history" class="btn" style="margin: 0 5px; background: transparent; color: white; border-color: white;">Transaction History</a>
                 <a href="/metrics" class="btn" style="margin: 0 5px;">Offline Training Metrics</a>
                 <a href="/api-docs" class="btn" style="margin: 0 5px;">API Reference</a>
+                <a href="/master" class="btn" style="margin: 0 5px; background: #333; color: white; border: none;">Control Center</a>
             </div>
         </div>
         <div class="container">
@@ -1118,6 +1902,36 @@ def get_history_page():
                     });
             }
             loadHistory();
+
+            function fullSystemRestart() {
+                if(!confirm("This will merge all live data into the master CSV, re-apply Hybrid Resampling (K-Means SMOTE-ENN), and completely re-train all models. Continue?")) return;
+                
+                const btn = document.querySelector('button[onclick="fullSystemRestart()"]');
+                const originalText = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = "Processing Full Restart...";
+                btn.style.opacity = '0.7';
+
+                fetch('/api/system-restart', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if(data.status === 'success') {
+                        alert("System Re-trained Successfully! Models are now updated.");
+                        window.location.reload();
+                    } else {
+                        alert("Restart Failed: " + data.detail);
+                        btn.disabled = false;
+                        btn.innerHTML = originalText;
+                        btn.style.opacity = '1';
+                    }
+                })
+                .catch(err => {
+                    alert("Error: " + err);
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                    btn.style.opacity = '1';
+                });
+            }
         </script>
     </body>
     </html>
@@ -1161,6 +1975,7 @@ def get_api_docs_page():
                 <a href="/history" class="btn" style="margin: 0 5px;">Transaction History</a>
                 <a href="/metrics" class="btn" style="margin: 0 5px;">Offline Training Metrics</a>
                 <a href="/api-docs" class="btn" style="margin: 0 5px; background: transparent; color: white; border-color: white;">API Reference</a>
+                <a href="/master" class="btn" style="margin: 0 5px; background: #333; color: white; border: none;">Control Center</a>
             </div>
         </div>
         <div class="container">
@@ -1189,6 +2004,11 @@ def get_api_docs_page():
         "Extreme_Gradient_Boosting": 0,
         "Light_Gradient_Boosting_Machine": 0
     },
+    "probabilities": {
+        "Random_Forest": 0.0312,
+        "Extreme_Gradient_Boosting": 0.0521,
+        "Light_Gradient_Boosting_Machine": 0.0843
+    },
     "feature_vector_used": [1596.79, 675, 1, 8, 19, 1]
 }</pre>
             </div>
@@ -1206,7 +2026,7 @@ def get_api_docs_page():
             
             <div class="endpoint" style="border-left-color: #ff7f0e;">
                 <div><span class="method" style="background:#ff7f0e;">POST</span><span class="url">/api/run-analysis</span></div>
-                <p>Programmatically triggers an entire automated `analyze_metrics.py` python script run on the host. Triggers SMOTETomek under/over data sampling explicitly over latest 196k row database block, trains all 3 ML models explicitly, evaluates test-holdout set natively, and overwrites the JSON payload file.</p>
+                <p>Programmatically triggers an entire automated `analyze_metrics.py` python script run on the host. Triggers Hybrid Resampling via K-Means SMOTE-ENN under/over data sampling explicitly over latest 196k row database block, trains all 3 ML models explicitly, evaluates test-holdout set natively, and overwrites the JSON payload file.</p>
             </div>
 
             <h2 style="margin-top: 40px; color: #1a237e;">Integration Code Scripts</h2>
@@ -1247,6 +2067,7 @@ print(response.text)
 #     "Extreme_Gradient_Boosting": 0,
 #     "Light_Gradient_Boosting_Machine": 0
 #   },
+#   "probabilities": {"Random_Forest": 0.03, "Extreme_Gradient_Boosting": 0.05, "Light_Gradient_Boosting_Machine": 0.08},
 #   "feature_vector_used": [1596.79, 675, 1, 8, 19, 1]
 # }</pre>
                 </div>
@@ -1338,7 +2159,166 @@ echo $response;
     """
     return html_content
 
+@app.get("/master", response_class=HTMLResponse)
+def get_master_page():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Master Control Panel</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background-color: #f4f6f9; color: #333; display: flex; flex-direction: column; min-height: 100vh; }
+            .header { background-color: #1a237e; color: white; padding: 20px; text-align: center; }
+            .container { max-width: 800px; margin: 60px auto; padding: 40px; background: white; border-radius: 16px; border: 1px solid #e0e0e0; box-shadow: 0 4px 20px rgba(0,0,0,0.1); text-align: center; }
+            .btn { background: white; padding: 10px 15px; border-radius: 4px; color: #1a237e; text-decoration: none; font-weight: bold; margin-top: 15px; display: inline-block; border: 1px solid white; transition: 0.3s; }
+            .btn:hover { background: transparent; color: white; }
+            .btn-master { background: #ef4444; color: white; padding: 20px 40px; border-radius: 50%; width: 220px; height: 220px; font-size: 1.25rem; font-weight: 800; text-transform: uppercase; border: 8px solid #7f1d1d; cursor: pointer; transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); display: flex; align-items: center; justify-content: center; margin: 0 auto; position: relative; overflow: hidden; }
+            .btn-master:hover:not(:disabled) { transform: scale(1.05); background: #f87171; box-shadow: 0 0 40px rgba(239, 68, 68, 0.6); }
+            .btn-master:active:not(:disabled) { transform: scale(0.95); }
+            .btn-master:disabled { background: #9e9e9e; border-color: #757575; cursor: not-allowed; opacity: 0.8; }
+            .status-text { margin-top: 30px; font-size: 1.1rem; color: #666; font-weight: 500; min-height: 1.5em; }
+            .cooldown-text { margin-top: 15px; font-size: 0.9rem; font-weight: bold; opacity: 0; transition: opacity 0.3s; }
+            .master-decoration { font-size: 3rem; margin-bottom: 20px; color: #ef4444; }
+            .description { color: #666; margin-bottom: 40px; font-size: 1rem; line-height: 1.6; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Engine Master Control</h1>
+            <p>Full Pipeline Orchestration</p>
+            <div style="margin-top: 15px;">
+                <a href="/" class="btn" style="margin: 0 5px;">Live Dashboard</a>
+                <a href="/simulate" class="btn" style="margin: 0 5px;">Simulate Transaction</a>
+                <a href="/history" class="btn" style="margin: 0 5px;">Transaction History</a>
+                <a href="/metrics" class="btn" style="margin: 0 5px;">Offline Training Metrics</a>
+                <a href="/api-docs" class="btn" style="margin: 0 5px;">API Reference</a>
+                <a href="/master" class="btn" style="margin: 0 5px; background: transparent; color: white; border-color: white;">Control Center</a>
+            </div>
+        </div>
+        
+        <div style="max-width: 800px; margin: 60px auto; padding: 0 20px;">
+        <div class="container">
+            <div class="master-decoration">☢</div>
+            <h2 style="margin-bottom: 10px; color: #333;">Full Pipeline Orchestration</h2>
+            <p class="description">Consolidate live traffic data, re-apply Hybrid Balancing (K-Means SMOTE-ENN), and rebuild all predictive models. This action is restricted by a 5-minute cooldown.</p>
+            
+            <button id="master-btn" class="btn-master" onclick="triggerMasterRestart()">
+                <span id="btn-label">INITIATE<br>RESTART</span>
+            </button>
+
+            <div id="status-display" class="status-text">SYSTEM STANDBY</div>
+            <div id="cooldown-display" class="cooldown-text"></div>
+        </div>
+
+        <script>
+            var isRunning     = false;
+            var progressTimer = null;
+            var cooldownTimer = null;
+            var pctValue      = 0;
+
+            function pctLabel(p, sub) {
+                return '<span style="font-size:2.4rem;font-weight:900;line-height:1;">' + p + '%</span>'
+                     + '<span style="display:block;font-size:0.65rem;letter-spacing:3px;margin-top:6px;">' + (sub||'TRAINING') + '</span>';
+            }
+
+            function triggerMasterRestart() {
+                if (isRunning) return;
+                if (!confirm("COMMAND CONFIRMATION: Are you sure you want to trigger a full system re-training cycle? This will lock the engine for the duration of the build.")) return;
+
+                var btn      = document.getElementById('master-btn');
+                var label    = document.getElementById('btn-label');
+                var status   = document.getElementById('status-display');
+                var cooldown = document.getElementById('cooldown-display');
+
+                // --- lock UI and start counter ---
+                isRunning    = true;
+                btn.disabled = true;
+                cooldown.style.opacity = '0';
+                if (cooldownTimer) { clearInterval(cooldownTimer); cooldownTimer = null; }
+
+                pctValue = 1;
+                label.innerHTML         = pctLabel(1);
+                status.innerText        = 'EXECUTING BALANCING & RE-TRAINING...';
+                status.style.color      = '#ef4444';
+
+                if (progressTimer) clearInterval(progressTimer);
+                progressTimer = setInterval(function () {
+                    pctValue = pctValue + (95 - pctValue) * 0.025;
+                    label.innerHTML = pctLabel(Math.round(pctValue));
+                }, 800);
+
+                fetch('/api/system-restart', { method: 'POST' })
+                    .then(function (r) { return r.json(); })
+                    .then(function (data) {
+                        // --- always stop the progress ticker first ---
+                        clearInterval(progressTimer);
+                        progressTimer = null;
+
+                        if (data.status === 'success') {
+                            label.innerHTML    = pctLabel(100, 'COMPLETE');
+                            status.innerText   = 'ENGINE REBUILD COMPLETE';
+                            status.style.color = '#10b981';
+                            setTimeout(function () {
+                                alert('SUCCESS: System re-validated and models redeployed.');
+                                location.reload();
+                            }, 900);
+
+                        } else if (data.detail && data.detail.toLowerCase().includes('cooldown')) {
+                            // Restore button label immediately so it looks clickable again after timer
+                            label.innerHTML    = 'INITIATE<br>RESTART';
+                            status.innerText   = 'COMMAND REJECTED';
+                            status.style.color = '#f43f5e';
+
+                            var m         = data.detail.match(/(\\d+)\\s+second/i);
+                            var remaining = m ? parseInt(m[1]) : 300;
+
+                            cooldown.innerText     = 'COOLDOWN ACTIVE. PLEASE WAIT ' + remaining + ' SECONDS.';
+                            cooldown.style.color   = '#c62828';
+                            cooldown.style.opacity = '1';
+
+                            cooldownTimer = setInterval(function () {
+                                remaining -= 1;
+                                if (remaining <= 0) {
+                                    clearInterval(cooldownTimer);
+                                    cooldownTimer        = null;
+                                    cooldown.innerText   = 'COOLDOWN CLEARED. READY TO RESTART.';
+                                    cooldown.style.color = '#10b981';
+                                    btn.disabled         = false;
+                                    isRunning            = false;
+                                } else {
+                                    cooldown.innerText = 'COOLDOWN ACTIVE. PLEASE WAIT ' + remaining + ' SECONDS.';
+                                }
+                            }, 1000);
+
+                        } else {
+                            label.innerHTML    = 'INITIATE<br>RESTART';
+                            status.innerText   = 'COMMAND REJECTED';
+                            status.style.color = '#f43f5e';
+                            alert('ERROR: ' + (data.detail || 'Unknown error during build'));
+                            btn.disabled = false;
+                            isRunning    = false;
+                        }
+                    })
+                    .catch(function () {
+                        clearInterval(progressTimer);
+                        progressTimer      = null;
+                        label.innerHTML    = 'INITIATE<br>RESTART';
+                        status.innerText   = 'INTERFACE ERROR';
+                        status.style.color = '#f43f5e';
+                        alert('COMMAND FAILURE: Interface timed out or server unavailable.');
+                        btn.disabled = false;
+                        isRunning    = false;
+                    });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
+
+
 if __name__ == "__main__":
     import uvicorn
-    # Optional: run directly without uvicorn command
     uvicorn.run(app, host="0.0.0.0", port=8000)
