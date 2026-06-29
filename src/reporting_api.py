@@ -556,13 +556,43 @@ def _proc_alive(proc) -> bool:
     return proc is not None and proc.poll() is None
 
 
+def _script_running_on_os(script: str) -> bool:
+    """Check if a script is actually running as a OS process (Linux only)."""
+    if os.name == 'nt':
+        return False
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', script],
+            capture_output=True, timeout=3,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _kill_script_on_os(script: str):
+    """Kill all OS processes matching a script path (Linux only)."""
+    if os.name == 'nt':
+        return
+    try:
+        subprocess.run(['pkill', '-TERM', '-f', script], capture_output=True, timeout=3)
+        import time as _time
+        _time.sleep(1)
+        # Force-kill anything still alive
+        subprocess.run(['pkill', '-KILL', '-f', script], capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
 @app.get("/api/pipeline/status")
 def pipeline_status():
+    result = {}
     with _pipeline_procs_lock:
-        return {
-            name: "running" if _proc_alive(_pipeline_procs.get(name)) else "stopped"
-            for name in _PIPELINE_SCRIPTS
-        }
+        for name, script in _PIPELINE_SCRIPTS.items():
+            tracked_alive = _proc_alive(_pipeline_procs.get(name))
+            os_alive      = _script_running_on_os(script)
+            result[name]  = "running" if (tracked_alive or os_alive) else "stopped"
+    return result
 
 
 @app.post("/api/pipeline/start")
@@ -572,7 +602,9 @@ def pipeline_start():
     already = []
     with _pipeline_procs_lock:
         for name, script in _PIPELINE_SCRIPTS.items():
-            if _proc_alive(_pipeline_procs.get(name)):
+            tracked_alive = _proc_alive(_pipeline_procs.get(name))
+            os_alive      = _script_running_on_os(script)
+            if tracked_alive or os_alive:
                 already.append(name)
                 continue
             proc = subprocess.Popen(
@@ -590,7 +622,7 @@ def pipeline_start():
 def pipeline_stop():
     stopped = []
     with _pipeline_procs_lock:
-        for name in list(_PIPELINE_SCRIPTS):
+        for name, script in _PIPELINE_SCRIPTS.items():
             proc = _pipeline_procs.pop(name, None)
             if _proc_alive(proc):
                 proc.terminate()
@@ -599,7 +631,12 @@ def pipeline_stop():
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 stopped.append(name)
-                logger.info("Pipeline: stopped %s", name)
+                logger.info("Pipeline: stopped tracked %s", name)
+            # Also kill any orphaned OS-level processes (survives uvicorn reloads)
+            _kill_script_on_os(script)
+            if name not in stopped:
+                stopped.append(name)
+                logger.info("Pipeline: killed orphaned %s via pkill", name)
     return {"status": "ok", "stopped": stopped}
 
 
