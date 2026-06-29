@@ -60,6 +60,10 @@ RAW_TOPIC    = 'raw-transactions'
 SCORED_TOPIC = 'scored-transactions'
 MAX_HISTORY  = 100
 
+# Absolute path to project root — computed from this file's location so it
+# works regardless of what directory uvicorn was launched from.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 last_restart_time = 0
 _db_lock          = threading.Lock()
 _stats_lock       = threading.Lock()
@@ -92,15 +96,20 @@ def _run_training_tracked(cmd_args):
     with _training_lock:
         _training_state.update({"running": True, "percent": 0, "message": "Starting...", "error": None})
     try:
+        env = {**os.environ, "PYTHONPATH": os.path.join(_PROJECT_ROOT, "src")}
         proc = subprocess.Popen(
             [sys.executable] + cmd_args,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, env={**os.environ, "PYTHONPATH": "src"},
+            text=True, cwd=_PROJECT_ROOT, env=env,
         )
+        last_lines = []
         for line in proc.stdout:
             line = line.strip()
             if line:
                 logger.info("[training] %s", line)
+                last_lines.append(line)
+                if len(last_lines) > 30:
+                    last_lines.pop(0)
             for keyword, pct in _PROGRESS_MILESTONES:
                 if keyword.lower() in line.lower():
                     with _training_lock:
@@ -113,7 +122,9 @@ def _run_training_tracked(cmd_args):
             if proc.returncode == 0:
                 _training_state.update({"running": False, "percent": 100, "message": "Training complete!"})
             else:
-                _training_state.update({"running": False, "percent": 0, "message": "Training failed.", "error": "Non-zero exit code"})
+                tail = " | ".join(last_lines[-5:]) if last_lines else "no output captured"
+                _training_state.update({"running": False, "percent": 0, "message": "Training failed.",
+                                        "error": f"Exit {proc.returncode}: {tail}"})
     except Exception as e:
         with _training_lock:
             _training_state.update({"running": False, "percent": 0, "message": "Error", "error": str(e)})
@@ -163,7 +174,8 @@ def _run_training():
     result = subprocess.run(
         [sys.executable, "src/analyze_metrics.py"],
         capture_output=True, text=True,
-        env={**os.environ, "PYTHONPATH": "src"},
+        cwd=_PROJECT_ROOT,
+        env={**os.environ, "PYTHONPATH": os.path.join(_PROJECT_ROOT, "src")},
     )
     if result.returncode == 0:
         logger.info("Auto-training completed successfully.")
@@ -438,9 +450,9 @@ def system_restart(request: Request):
         logger.info("Starting full pipeline restart (absorb-live + retrain)...")
         result = subprocess.run(
             [sys.executable, "src/analyze_metrics.py", "--absorb-live"],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "PYTHONPATH": "src"},
+            capture_output=True, text=True,
+            cwd=_PROJECT_ROOT,
+            env={**os.environ, "PYTHONPATH": os.path.join(_PROJECT_ROOT, "src")},
         )
         logger.info("Full restart completed.")
         return {"status": "success", "output": result.stdout}
@@ -565,7 +577,8 @@ def pipeline_start():
                 continue
             proc = subprocess.Popen(
                 [sys.executable, script],
-                env={**os.environ, "PYTHONPATH": "src"},
+                cwd=_PROJECT_ROOT,
+                env={**os.environ, "PYTHONPATH": os.path.join(_PROJECT_ROOT, "src")},
             )
             _pipeline_procs[name] = proc
             started.append(name)
