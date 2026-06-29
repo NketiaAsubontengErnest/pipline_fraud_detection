@@ -32,8 +32,8 @@ from sklearn.metrics import (
     roc_curve,
     precision_recall_curve,
 )
-from imblearn.over_sampling import KMeansSMOTE, RandomOverSampler
-from imblearn.under_sampling import RandomUnderSampler, EditedNearestNeighbours
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline
 from features import extract_features
 
@@ -130,22 +130,22 @@ def _build_model(name, params=None):
 
     defaults = {
         "Random Forest": dict(
-            n_estimators=500, max_depth=15, min_samples_leaf=2,
+            n_estimators=200, max_depth=12, min_samples_leaf=2,
             min_samples_split=5, max_features='sqrt', max_samples=0.85,
-            class_weight='balanced_subsample', n_jobs=-2, random_state=42,
+            class_weight='balanced_subsample', n_jobs=-1, random_state=42,
         ),
         "Extreme Gradient Boosting": dict(
-            n_estimators=600, max_depth=5, learning_rate=0.03,
+            n_estimators=200, max_depth=5, learning_rate=0.08,
             subsample=0.85, colsample_bytree=0.85, colsample_bylevel=0.8,
             min_child_weight=3, gamma=0.05, reg_alpha=0.05, reg_lambda=2.0,
             random_state=42, eval_metric='logloss', verbosity=0,
         ),
         "Light Gradient Boosting Machine": dict(
-            n_estimators=600, num_leaves=63, max_depth=-1,
-            learning_rate=0.03, subsample=0.85, colsample_bytree=0.85,
+            n_estimators=200, num_leaves=63, max_depth=-1,
+            learning_rate=0.08, subsample=0.85, colsample_bytree=0.85,
             min_child_samples=8, bagging_freq=5,
             reg_alpha=0.05, reg_lambda=1.0,
-            n_jobs=-2, random_state=42, verbose=-1,
+            n_jobs=-1, random_state=42, verbose=-1,
         ),
     }
     kw = {**defaults[name], **(params or {})}
@@ -168,7 +168,7 @@ def plot_class_distribution(y_before, y_after):
     for p in axes[0].patches:
         axes[0].annotate(f'{int(p.get_height())}', (p.get_x() + 0.3, p.get_height() + 200))
     sns.countplot(data=df_a, x='IsFraud', hue='IsFraud', ax=axes[1], palette="pastel", legend=False)
-    axes[1].set_title("Class Distribution After Balance (ADASYN)")
+    axes[1].set_title("Class Distribution After Balance (SMOTE)")
     axes[1].set_xlabel("IsFraud"); axes[1].set_ylabel("Count")
     for p in axes[1].patches:
         axes[1].annotate(f'{int(p.get_height())}', (p.get_x() + 0.3, p.get_height() + 200))
@@ -323,24 +323,23 @@ def train_and_evaluate(absorb_live=False, tune=False):
     logger.info("Train: %d  Val: %d  Test: %d", len(X_train), len(X_val), len(X_test))
 
     # ------------------------------------------------------------------
-    # Resampling: cap majority → K-Means SMOTE → ENN → final sync
-    # K-Means SMOTE clusters minority class first, generates synthetic
-    # samples only within safe clusters. ENN then cleans noisy borderline
-    # samples. RandomOverSampler equalises any residual imbalance from ENN.
+    # Resampling: cap majority → SMOTE → final sync
+    # RandomUnderSampler caps the legit class first so SMOTE runs on a
+    # smaller dataset. SMOTE generates synthetic minority samples via
+    # k-nearest-neighbours interpolation (much faster than KMeansSMOTE).
+    # RandomOverSampler equalises any residual imbalance.
     # ------------------------------------------------------------------
-    logger.info("Applying Hybrid Resampling (K-Means SMOTE + ENN) to training data only...")
+    logger.info("Applying Hybrid Resampling (SMOTE) to training data only...")
     current_legit = sum(y_train == 0)
-    legit_cap = min(current_legit, 50000)
+    legit_cap = min(current_legit, 40000)
 
     cap_majority  = RandomUnderSampler(sampling_strategy={0: legit_cap}, random_state=42)
-    kmeans_smote  = KMeansSMOTE(sampling_strategy=1.0, random_state=42, k_neighbors=5, kmeans_estimator=10, cluster_balance_threshold=0.1)
-    enn           = EditedNearestNeighbours(sampling_strategy='all')
+    smote         = SMOTE(sampling_strategy=1.0, random_state=42, k_neighbors=5, n_jobs=-1)
     final_sync    = RandomOverSampler(sampling_strategy='auto', random_state=42)
 
     balance_pipeline = Pipeline(steps=[
         ('cap_majority', cap_majority),
-        ('kmeans_smote', kmeans_smote),
-        ('enn',          enn),
+        ('smote',        smote),
         ('final_sync',   final_sync),
     ])
 

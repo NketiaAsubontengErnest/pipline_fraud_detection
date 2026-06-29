@@ -1,3 +1,4 @@
+import hashlib
 import json
 import asyncio
 import logging
@@ -26,7 +27,34 @@ logger = logging.getLogger(__name__)
 KAFKA_BROKER     = os.getenv('KAFKA_BROKER', 'localhost:9092')
 DB_PATH          = os.getenv('DB_PATH', 'Data/transactions.db')
 RESTART_API_KEY  = os.getenv('RESTART_API_KEY', '')
-RESTART_COOLDOWN = int(os.getenv('RESTART_COOLDOWN', '300'))
+RESTART_COOLDOWN   = int(os.getenv('RESTART_COOLDOWN', '300'))
+
+_PASSWORD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Data', 'dashboard_password.txt')
+
+def _load_password() -> str:
+    try:
+        if os.path.exists(_PASSWORD_FILE):
+            p = open(_PASSWORD_FILE, 'r', encoding='utf-8').read().strip()
+            if p:
+                return p
+    except Exception:
+        pass
+    return os.getenv('DASHBOARD_PASSWORD', 'admin')
+
+DASHBOARD_PASSWORD = _load_password()
+
+def _save_password(new_pwd: str):
+    global DASHBOARD_PASSWORD
+    os.makedirs(os.path.dirname(_PASSWORD_FILE), exist_ok=True)
+    with open(_PASSWORD_FILE, 'w', encoding='utf-8') as f:
+        f.write(new_pwd)
+    DASHBOARD_PASSWORD = new_pwd
+
+def _auth_token() -> str:
+    return hashlib.sha256(DASHBOARD_PASSWORD.encode()).hexdigest()
+
+def _check_cookie(request: Request) -> bool:
+    return request.cookies.get('dash_token') == _auth_token()
 
 RAW_TOPIC    = 'raw-transactions'
 SCORED_TOPIC = 'scored-transactions'
@@ -366,8 +394,10 @@ def get_recent_transactions():
     return list(transactions_store)
 
 @app.post("/api/run-analysis")
-def run_analysis():
+def run_analysis(request: Request):
     """Retrain models on current data.csv — runs in background, track via /api/training-progress."""
+    if request.headers.get("X-Dash-Password", "") != DASHBOARD_PASSWORD:
+        return JSONResponse({"status": "error", "detail": "Incorrect password"}, status_code=401)
     with _training_lock:
         if _training_state["running"]:
             return {"status": "already_running", "detail": "Training is already in progress."}
@@ -717,6 +747,117 @@ def get_saved_transactions(page: int = 1, limit: int = 50):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+def _get_login_page() -> str:
+    return '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Restricted</title>
+    <style>
+        *{box-sizing:border-box;}
+        body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;background:#f4f6f9;
+             display:flex;align-items:center;justify-content:center;min-height:100vh;}
+        .card{background:white;padding:48px 44px;border-radius:14px;
+              box-shadow:0 4px 24px rgba(0,0,0,0.13);width:380px;max-width:95vw;text-align:center;}
+        .icon{width:58px;height:58px;background:#1a237e;border-radius:50%;
+              margin:0 auto 20px;display:flex;align-items:center;justify-content:center;}
+        .icon-body{width:20px;height:14px;border:3px solid white;border-radius:3px;position:relative;}
+        .icon-body::before{content:"";position:absolute;top:-9px;left:50%;
+            transform:translateX(-50%);width:11px;height:9px;
+            border:2.5px solid white;border-radius:6px 6px 0 0;border-bottom:none;}
+        .icon-keyhole{position:absolute;top:50%;left:50%;transform:translate(-50%,-40%);
+            width:4px;height:6px;background:#1a237e;border-radius:2px;}
+        h2{color:#1a237e;margin:0 0 6px;font-size:1.35em;}
+        p{color:#777;font-size:0.87em;margin:0 0 26px;line-height:1.5;}
+        input{width:100%;padding:12px 14px;border:1.5px solid #ddd;border-radius:8px;
+              font-size:1em;margin-bottom:14px;transition:border-color .2s;}
+        input:focus{outline:none;border-color:#1a237e;}
+        .btn{width:100%;padding:13px;background:#1a237e;color:white;border:none;
+             border-radius:8px;font-size:1em;font-weight:700;cursor:pointer;
+             letter-spacing:.5px;transition:background .2s;}
+        .btn:hover{background:#283593;}
+        .btn:disabled{background:#9e9e9e;cursor:not-allowed;}
+        .err{color:#c62828;font-size:0.84em;margin-top:10px;min-height:18px;}
+    </style>
+</head>
+<body>
+<div class="card">
+    <div class="icon">
+        <div class="icon-body"><div class="icon-keyhole"></div></div>
+    </div>
+    <h2>Control Center</h2>
+    <p>This area is password protected.<br>Enter the dashboard password to continue.</p>
+    <input type="password" id="pwd" placeholder="Dashboard password"
+           onkeydown="if(event.key===\'Enter\')login()">
+    <button class="btn" id="btn" onclick="login()">Unlock Access</button>
+    <div class="err" id="err"></div>
+</div>
+<script>
+document.getElementById(\'pwd\').focus();
+function login(){
+    var pwd=document.getElementById(\'pwd\').value;
+    var btn=document.getElementById(\'btn\');
+    if(!pwd)return;
+    btn.disabled=true; btn.textContent=\'Verifying...\';
+    document.getElementById(\'err\').textContent=\'\';
+    fetch(\'/api/master-login\',{
+        method:\'POST\',headers:{\'Content-Type\':\'application/json\'},
+        body:JSON.stringify({password:pwd})
+    })
+    .then(function(r){return r.json();})
+    .then(function(d){
+        if(d.status===\'ok\'){window.location.reload();}
+        else{
+            document.getElementById(\'err\').textContent=\'Incorrect password. Please try again.\';
+            document.getElementById(\'pwd\').value=\'\';
+            document.getElementById(\'pwd\').focus();
+            btn.disabled=false; btn.textContent=\'Unlock Access\';
+        }
+    })
+    .catch(function(){
+        document.getElementById(\'err\').textContent=\'Connection error. Please try again.\';
+        btn.disabled=false; btn.textContent=\'Unlock Access\';
+    });
+}
+</script>
+</body>
+</html>'''
+
+
+class PasswordPayload(BaseModel):
+    password: str
+
+
+@app.post("/api/master-login")
+def master_login(payload: PasswordPayload):
+    """Verify dashboard password and set auth cookie."""
+    if payload.password != DASHBOARD_PASSWORD:
+        return JSONResponse({"status": "error", "detail": "Incorrect password"}, status_code=401)
+    resp = JSONResponse({"status": "ok"})
+    resp.set_cookie("dash_token", _auth_token(), httponly=True, samesite="lax", max_age=86400)
+    return resp
+
+
+class ChangePasswordPayload(BaseModel):
+    current: str
+    new_password: str
+
+@app.post("/api/change-password")
+def change_password_endpoint(payload: ChangePasswordPayload, request: Request):
+    """Change the dashboard password — requires active session cookie."""
+    if not _check_cookie(request):
+        return JSONResponse({"status": "error", "detail": "Not authenticated"}, status_code=401)
+    if payload.current != DASHBOARD_PASSWORD:
+        return JSONResponse({"status": "error", "detail": "Current password is incorrect"}, status_code=401)
+    if not payload.new_password.strip():
+        return JSONResponse({"status": "error", "detail": "New password cannot be empty"}, status_code=400)
+    _save_password(payload.new_password.strip())
+    resp = JSONResponse({"status": "ok"})
+    resp.set_cookie("dash_token", _auth_token(), httponly=True, samesite="lax", max_age=86400)
+    return resp
+
+
 @app.post("/api/clear-transactions")
 def clear_transactions():
     """Delete all rows from live_transactions, reset in-memory store and counters."""
@@ -1007,27 +1148,68 @@ def get_metrics_page():
             </div>
         </div>
         
+        <!-- Password modal for Run Retrain -->
+        <div id="train-pwd-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:9999;display:flex;align-items:center;justify-content:center;">
+            <div style="background:#fff;border-radius:14px;padding:36px 32px;max-width:360px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,0.22);text-align:center;">
+                <div style="font-size:2.2em;margin-bottom:10px;">&#128274;</div>
+                <h3 style="margin:0 0 6px;color:#1a237e;font-size:1.2em;">Password Required</h3>
+                <p style="color:#555;font-size:0.9em;margin:0 0 18px;">Enter the dashboard password to start retraining.</p>
+                <input type="password" id="train-pwd-input" placeholder="Password"
+                    style="width:100%;box-sizing:border-box;padding:10px 14px;border:1.5px solid #c5cae9;border-radius:8px;font-size:1em;margin-bottom:10px;outline:none;"
+                    onkeydown="if(event.key==='Enter')submitTrainPwd()">
+                <div id="train-pwd-err" style="color:#d32f2f;font-size:0.85em;min-height:18px;margin-bottom:8px;"></div>
+                <div style="display:flex;gap:10px;justify-content:center;">
+                    <button onclick="closeTrainModal()" style="padding:9px 22px;border-radius:8px;border:1.5px solid #ccc;background:#f5f5f5;cursor:pointer;font-size:0.95em;">Cancel</button>
+                    <button onclick="submitTrainPwd()" style="padding:9px 22px;border-radius:8px;border:none;background:#1a237e;color:#fff;cursor:pointer;font-size:0.95em;font-weight:bold;">Unlock &amp; Train</button>
+                </div>
+            </div>
+        </div>
         <script>
         let _pollTimer = null;
 
         function runAnalysis() {
-            const btn  = document.getElementById('run-btn');
-            const wrap = document.getElementById('progress-wrap');
-            const bar  = document.getElementById('progress-bar');
-            const msg  = document.getElementById('progress-msg');
-            const pct  = document.getElementById('progress-pct');
+            const modal = document.getElementById('train-pwd-modal');
+            modal.style.display = 'flex';
+            document.getElementById('train-pwd-input').value = '';
+            document.getElementById('train-pwd-err').textContent = '';
+            setTimeout(() => document.getElementById('train-pwd-input').focus(), 50);
+        }
 
-            btn.disabled = true;
-            btn.style.opacity = '0.6';
-            btn.textContent = 'Training...';
-            wrap.style.display = 'block';
-            bar.style.width = '0%';
-            msg.textContent = 'Starting...';
-            pct.textContent = '0%';
+        function closeTrainModal() {
+            document.getElementById('train-pwd-modal').style.display = 'none';
+        }
 
-            fetch('/api/run-analysis', { method: 'POST' })
+        function submitTrainPwd() {
+            const pwd = document.getElementById('train-pwd-input').value;
+            const errEl = document.getElementById('train-pwd-err');
+            errEl.textContent = '';
+            if (!pwd) { errEl.textContent = 'Please enter a password.'; return; }
+
+            fetch('/api/run-analysis', {
+                method: 'POST',
+                headers: { 'X-Dash-Password': pwd }
+            })
             .then(r => r.json())
             .then(data => {
+                if (data.status === 'error' && data.detail === 'Incorrect password') {
+                    errEl.textContent = 'Incorrect password. Try again.';
+                    document.getElementById('train-pwd-input').value = '';
+                    document.getElementById('train-pwd-input').focus();
+                    return;
+                }
+                closeTrainModal();
+                const btn  = document.getElementById('run-btn');
+                const wrap = document.getElementById('progress-wrap');
+                const bar  = document.getElementById('progress-bar');
+                const msg  = document.getElementById('progress-msg');
+                const pct  = document.getElementById('progress-pct');
+                btn.disabled = true;
+                btn.style.opacity = '0.6';
+                btn.textContent = 'Training...';
+                wrap.style.display = 'block';
+                bar.style.width = '0%';
+                msg.textContent = 'Starting...';
+                pct.textContent = '0%';
                 if (data.status === 'already_running') {
                     msg.textContent = 'Already running — tracking existing progress...';
                 } else if (data.status !== 'started') {
@@ -1041,11 +1223,7 @@ def get_metrics_page():
                 _pollProgress();
             })
             .catch(err => {
-                btn.disabled = false;
-                btn.style.opacity = '1';
-                btn.innerHTML = '&#9654; Run Active Loop &amp; Train Model';
-                wrap.style.display = 'none';
-                alert('Request failed: ' + err);
+                errEl.textContent = 'Request failed: ' + err;
             });
         }
 
@@ -1636,10 +1814,17 @@ def get_dashboard():
             .val-legit { color: #388e3c; }
             .btn { background: white; padding: 10px 15px; border-radius: 4px; color: #1a237e; text-decoration: none; font-weight: bold; margin-top: 15px; display: inline-block; border: 1px solid white; transition: 0.3s; }
             .btn:hover { background: transparent; color: white; }
+            #tx-table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); font-size: 0.88em; table-layout: fixed; }
+            #tx-table th, #tx-table td { padding: 9px 10px; text-align: left; border-bottom: 1px solid #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #tx-table th { background-color: #e8eaf6; font-weight: bold; }
+            #tx-table col.col-time       { width: 90px; }
+            #tx-table col.col-txid       { width: auto; }
+            #tx-table col.col-vote       { width: 80px; }
+            #tx-table col.col-status     { width: 90px; }
             table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
             th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #ddd; }
             th { background-color: #e8eaf6; font-weight: bold; }
-            .badge { padding: 5px 10px; border-radius: 12px; font-size: 0.85em; font-weight: bold; }
+            .badge { padding: 4px 9px; border-radius: 12px; font-size: 0.85em; font-weight: bold; }
             .badge-LEGIT { background-color: #c8e6c9; color: #2e7d32; }
             .badge-ALERT { background-color: #ffcdd2; color: #c62828; }
             .votes { font-family: monospace; }
@@ -1653,6 +1838,7 @@ def get_dashboard():
                 .stat-card { margin: 5px 0 !important; min-width: unset !important; }
                 .stat-value { font-size: 1.6em; }
                 .container { padding: 0 12px; }
+                #tx-table th, #tx-table td { padding: 7px 8px; font-size: 0.8em; }
                 th, td { padding: 8px 10px; font-size: 0.85em; }
             }
         </style>
@@ -1686,21 +1872,27 @@ def get_dashboard():
                 </div>
             </div>
 
-            </div>
-            
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:8px;">
                 <h3 style="margin:0;">Recent Transactions (Live Data)</h3>
                 <button id="clear-btn" onclick="clearTransactions()" style="background:#d32f2f;color:white;border:none;padding:8px 18px;border-radius:6px;font-weight:bold;font-size:0.85em;cursor:pointer;">Clear All Data</button>
             </div>
             <div style="overflow-x:auto;">
             <table id="tx-table">
+                <colgroup>
+                    <col class="col-time">
+                    <col class="col-txid">
+                    <col class="col-vote">
+                    <col class="col-vote">
+                    <col class="col-vote">
+                    <col class="col-status">
+                </colgroup>
                 <thead>
                     <tr>
                         <th>Time</th>
                         <th>Transaction ID</th>
-                        <th>RF Vote</th>
-                        <th>XGB Vote</th>
-                        <th>LGB Vote</th>
+                        <th>RF</th>
+                        <th>XGB</th>
+                        <th>LGB</th>
                         <th>Status</th>
                     </tr>
                 </thead>
@@ -2410,7 +2602,9 @@ echo $response;
     return html_content
 
 @app.get("/master", response_class=HTMLResponse)
-def get_master_page():
+def get_master_page(request: Request):
+    if not _check_cookie(request):
+        return HTMLResponse(content=_get_login_page())
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
@@ -2479,10 +2673,37 @@ def get_master_page():
             </div>
         </div>
 
+        <!-- ── Change Password ── -->
+        <div style="background:white;padding:28px 35px;border-radius:14px;border:1px solid #e0e0e0;box-shadow:0 2px 10px rgba(0,0,0,0.08);margin-bottom:24px;">
+            <h3 style="margin:0 0 6px;color:#1a237e;font-size:0.85rem;letter-spacing:2px;text-transform:uppercase;font-weight:700;">&#128274; Change Password</h3>
+            <p style="margin:0 0 20px;color:#888;font-size:0.82rem;">Update the dashboard access password. The new password is saved to disk and takes effect immediately.</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;max-width:600px;margin:0 auto 14px;">
+                <div>
+                    <label style="display:block;font-size:0.78rem;color:#555;margin-bottom:4px;">Current Password</label>
+                    <input type="password" id="cp-current" placeholder="Current password"
+                        style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid #c5cae9;border-radius:8px;font-size:0.9em;outline:none;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.78rem;color:#555;margin-bottom:4px;">New Password</label>
+                    <input type="password" id="cp-new" placeholder="New password"
+                        style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid #c5cae9;border-radius:8px;font-size:0.9em;outline:none;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.78rem;color:#555;margin-bottom:4px;">Confirm Password</label>
+                    <input type="password" id="cp-confirm" placeholder="Confirm password"
+                        style="width:100%;box-sizing:border-box;padding:9px 12px;border:1.5px solid #c5cae9;border-radius:8px;font-size:0.9em;outline:none;">
+                </div>
+            </div>
+            <div style="text-align:center;">
+                <div id="cp-msg" style="font-size:0.84rem;min-height:18px;margin-bottom:10px;"></div>
+                <button onclick="savePassword()" style="background:#1a237e;color:#fff;border:none;padding:10px 30px;border-radius:8px;font-weight:700;font-size:0.92rem;cursor:pointer;letter-spacing:1px;">Save Password</button>
+            </div>
+        </div>
+
         <div class="container">
             <div class="master-decoration">☢</div>
             <h2 style="margin-bottom: 10px; color: #333;">Full Pipeline Orchestration</h2>
-            <p class="description">Consolidate live traffic data, re-apply Hybrid Balancing (K-Means SMOTE-ENN), and rebuild all predictive models. This action is restricted by a 5-minute cooldown.</p>
+            <p class="description">Consolidate live traffic data, re-apply Hybrid Balancing (SMOTE), and rebuild all predictive models. This action is restricted by a 5-minute cooldown.</p>
 
             <button id="master-btn" class="btn-master" onclick="triggerMasterRestart()">
                 <span id="btn-label">INITIATE<br>RESTART</span>
@@ -2610,6 +2831,37 @@ def get_master_page():
             refreshPipelineStatus();
             _pipelineStatusInterval = setInterval(refreshPipelineStatus, 3000);
             // ─────────────────────────────────────────────────────────────
+
+            function savePassword() {
+                var cur     = document.getElementById('cp-current').value;
+                var nw      = document.getElementById('cp-new').value;
+                var confirm = document.getElementById('cp-confirm').value;
+                var msg     = document.getElementById('cp-msg');
+                msg.style.color = '#d32f2f';
+                if (!cur || !nw || !confirm) { msg.textContent = 'All three fields are required.'; return; }
+                if (nw !== confirm) { msg.textContent = 'New passwords do not match.'; return; }
+                msg.style.color = '#555';
+                msg.textContent = 'Saving...';
+                fetch('/api/change-password', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({current: cur, new_password: nw})
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.status === 'ok') {
+                        msg.style.color = '#2e7d32';
+                        msg.textContent = 'Password updated successfully!';
+                        document.getElementById('cp-current').value = '';
+                        document.getElementById('cp-new').value = '';
+                        document.getElementById('cp-confirm').value = '';
+                    } else {
+                        msg.style.color = '#d32f2f';
+                        msg.textContent = d.detail || 'Error saving password.';
+                    }
+                })
+                .catch(function() { msg.style.color='#d32f2f'; msg.textContent='Request failed.'; });
+            }
 
             function triggerMasterRestart() {
                 if (isRunning) return;
